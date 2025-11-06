@@ -1,0 +1,5 @@
+spade>=3.2.1
+networkx>=3.2.1
+numpy>=1.26.0
+pandas>=2.1.0
+aioxmpp>=0.13.3
