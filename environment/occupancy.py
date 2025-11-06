@@ -2,46 +2,46 @@ from collections import defaultdict
 
 class Occupancy:
     """
-    Guarda quem está em cada aresta (u, v) e calcula
-    ocupação (contagem) e densidade (0..1) com base na capacidade.
+    Keeps track of which vehicles are on each edge (u, v)
+    and computes both occupancy (count) and density (0..1) based on capacity.
     """
 
     def __init__(self, default_capacity: int = 5):
-        # Ex.: road_usage[(u, v)] = {"veh1", "veh7", ...}
+        # Example: road_usage[(u, v)] = {"veh1", "veh7", ...}
         self.road_usage = defaultdict(set)
-        # Capacidade por aresta; por omissão usamos default_capacity
+        # Capacity per edge; by default, we use default_capacity
         self.capacity = defaultdict(lambda: default_capacity)
 
-    # --- Configuração da capacidade (opcional por aresta) ---
+    # --- Capacity configuration (optional per edge) ---
     def set_capacity(self, u, v, cap: int) -> None:
-        """Define capacidade específica para a aresta (u, v)."""
+        """Sets a specific capacity for the edge (u, v)."""
         self.capacity[(u, v)] = max(int(cap), 1)
 
-    # --- Entrar / sair de uma aresta ---
+    # --- Vehicle entering / leaving an edge ---
     def enter(self, u, v, vehicle_id: str) -> None:
-        """Regista que um veículo entrou na aresta (u, v)."""
+        """Registers that a vehicle has entered the edge (u, v)."""
         self.road_usage[(u, v)].add(vehicle_id)
 
     def leave(self, u, v, vehicle_id: str) -> None:
-        """Regista que um veículo saiu da aresta (u, v)."""
+        """Registers that a vehicle has left the edge (u, v)."""
         self.road_usage[(u, v)].discard(vehicle_id)
 
-    # --- Leituras rápidas ---
+    # --- Quick queries ---
     def count(self, u, v) -> int:
-        """Número de veículos atualmente na aresta (u, v)."""
+        """Returns the number of vehicles currently on the edge (u, v)."""
         return len(self.road_usage[(u, v)])
 
     def rho(self, u, v) -> float:
         """
-        Densidade normalizada: count / capacidade, limitada a 1.0.
-        Útil para custo dinâmico no routing e para semáforos adaptarem fases.
+        Normalized density: count / capacity, limited to 1.0.
+        Useful for dynamic routing cost and adaptive traffic light control.
         """
         cap = max(self.capacity[(u, v)], 1)
         return min(self.count(u, v) / cap, 1.0)
 
     def is_full(self, u, v, threshold: float = 1.0) -> bool:
         """
-        Indica se a aresta está "cheia" (rho >= threshold).
-        Por omissão, considera cheia quando rho==1.0.
+        Indicates whether the edge is 'full' (rho >= threshold).
+        By default, considers full when rho == 1.0.
         """
         return self.rho(u, v) >= threshold

@@ -4,19 +4,19 @@ from agents.traffic_light import TrafficLightAgent
 from agents.emergency_vehicle import EmergencyVehicleAgent
 from agents.incident_reporter import IncidentReporterAgent
 
-# novos módulos do ambiente
+# New environment modules
 from environment.occupancy import Occupancy
 from environment.events import EventManager
 from utils.metrics import Metrics
 
 
 async def main():
-    # --- Inicializar ambiente partilhado ---
+    # --- Initialize shared environment ---
     occupancy = Occupancy(default_capacity=5)
     events = EventManager()
     metrics = Metrics("metrics.csv")
 
-    # --- Criar agentes ---
+    # --- Create agents ---
     tl1 = TrafficLightAgent("light1@localhost", "password", occupancy, events)
     tl2 = TrafficLightAgent("light2@localhost", "password", occupancy, events)
 
@@ -26,17 +26,17 @@ async def main():
     em = EmergencyVehicleAgent("emergency@localhost", "password", "Ambulance", occupancy, events, metrics)
     reporter = IncidentReporterAgent("reporter@localhost", "password", events)
 
-    # --- Iniciar agentes ---
+    # --- Start all agents ---
     agents = [tl1, tl2, v1, v2, em, reporter]
     for agent in agents:
         await agent.start(auto_register=True)
 
     print("🚦 Simulation started")
 
-    # --- Loop da simulação (exemplo: 60 segundos) ---
+    # --- Simulation loop (example: 60 seconds) ---
     try:
         for t in range(60):
-            # (opcional) recolher congestão média a cada segundo
+            # (optional) collect average congestion each second
             avg_rho = 0.0
             if occupancy.road_usage:
                 total_rho = sum(occupancy.rho(u, v) for (u, v) in occupancy.road_usage.keys())
@@ -47,9 +47,10 @@ async def main():
     except KeyboardInterrupt:
         print("🛑 Simulation stopped manually")
 
-    # --- Parar agentes e guardar métricas ---
+    # --- Stop all agents and save metrics ---
     for agent in agents:
         await agent.stop()
+
     metrics.save()
     print("✅ Simulation finished, metrics saved.")
 
