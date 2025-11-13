@@ -1,18 +1,22 @@
+# environment/city.py
 import networkx as nx
-from environment.event_manager import EventManager
-from environment.occupancy import Occupancy
+from environment.events import EventManager          # <- file name is 'events.py'
+from environment.occupancy import Occupancy          # <- needs the graph
 
 class CityEnvironment:
     def __init__(self, width=20, height=20, congestion_weight=2.0):
         self.width = width
         self.height = height
         self.graph = nx.grid_2d_graph(width, height)
+
         self.traffic_lights = self._generate_traffic_lights()
         self.buildings = self._generate_buildings()
         self.hospitals = self._generate_hospitals()
+
         self.event_manager = EventManager()
-        self.occupancy = Occupancy()
+        self.occupancy = Occupancy(self.graph)       # <- pass the graph
         self.congestion_weight = congestion_weight
+
         self._initialize_edge_weights()
         self._annotate_graph()
 
@@ -25,12 +29,14 @@ class CityEnvironment:
         self.event_manager.clear_expired()
         for u, v in self.graph.edges:
             base = 1.0
-            incident_penalty = self.event_manager.penalty((u, v))
-            density = self.occupancy.get_ema_density(u, v)
+            incident_penalty = self.event_manager.penalty((u, v))   # from events.py
+            density = self.occupancy.rho((u, v))                    # <- use rho()
             self.graph[u][v]['weight'] = base + incident_penalty + self.congestion_weight * density
 
     def _generate_traffic_lights(self):
-        return {f"light_{x}_{y}": (x, y) for x in range(0, self.width, 4) for y in range(0, self.height, 4)}
+        return {f"light_{x}_{y}": (x, y)
+                for x in range(0, self.width, 4)
+                for y in range(0, self.height, 4)}
 
     def _generate_buildings(self):
         return {f"building_{x}_{y}": (x+0.5, y+0.5)
@@ -54,13 +60,10 @@ class CityEnvironment:
     def get_shortest_route(self, start, end, method="astar"):
         """Compute shortest route using A* or Dijkstra with dynamic weights."""
         self.update_edge_weights()
-
         if method == "astar":
             try:
                 return nx.astar_path(
-                    self.graph,
-                    start,
-                    end,
+                    self.graph, start, end,
                     heuristic=lambda a, b: abs(a[0]-b[0]) + abs(a[1]-b[1]),
                     weight="weight"
                 )

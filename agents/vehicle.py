@@ -1,82 +1,230 @@
+import asyncio
 import random
 import networkx as nx
 from spade import agent, behaviour
 from spade.message import Message
 
+# If your IncidentReporter sets msg.set_metadata("type", "incident"), set this True.
+# If not, leave False and we'll fall back to a text-only peek that won't crash movement.
+USE_FILTERED_INCIDENTS = False
+try:
+    from spade.template import Template
+except Exception:
+    Template = None
+    USE_FILTERED_INCIDENTS = False
+
+
+def manhattan(a, b):
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
 class VehicleAgent(agent.Agent):
-    def __init__(self, jid, password, name, city_env):
-        """
-        :param jid: JID for the vehicle agent
-        :param password: XMPP password
-        :param name: Vehicle name (for identification)
-        :param city_env: Instance of CityEnvironment
-        """
+    def __init__(self, jid, password, name, city_env, shared=None):
         super().__init__(jid, password)
-        self.name = name
+        self.label = name
         self.city = city_env
-        self.position = random.choice(list(city_env.graph.nodes))
+        self.shared = shared or {"vehicles": {}}
 
-    # ---------------------------------------------------------------------
-    # Movement and logic
-    # ---------------------------------------------------------------------
-    def move_randomly(self):
-        """Move randomly to a neighboring node in the graph."""
+        nodes = list(city_env.graph.nodes)
+        self.position = random.choice(nodes)
+
+        # Routing state
+        self.goal = None
+        self.path = []              # list of nodes (including current + goal)
+        self.steps_since_plan = 0
+        self.replan_every = 10      # periodic replan safety net
+
+        # visible immediately
+        try:
+            self.shared.setdefault("vehicles", {})[self.label] = self.position
+        except Exception as e:
+            print("[VIS-WRITE vehicle init ERROR]", e)
+
+    # ---------------- Helpers ----------------
+    def _dynamic_weight(self, u, v, d):
+        """
+        Edge cost used by A*:
+          base = 1
+          + occupancy term (if available)
+          + incident penalty (if available)
+        """
+        base = d.get("weight", 1.0)
+        # occupancy
+        try:
+            occ = self.city.occupancy.edge_density(u, v)  # 0..?
+        except Exception:
+            occ = 0.0
+        # incidents
+        try:
+            pen = self.city.event_manager.edge_penalty(u, v)  # 0..?
+        except Exception:
+            pen = 0.0
+        return base + 0.6 * occ + pen
+
+    def _choose_far_goal(self):
+        """Pick a goal 'far enough' (Manhattan >= 8), not equal to here."""
+        here = self.position
+        candidates = [n for n in self.city.graph.nodes
+                      if n != here and manhattan(n, here) >= 8]
+        if not candidates:
+            candidates = [n for n in self.city.graph.nodes if n != here]
+        return random.choice(candidates) if candidates else here
+
+    def _plan_to(self, dest):
+        try:
+            # A* with dynamic edge weight
+            self.path = nx.astar_path(
+                self.city.graph,
+                self.position,
+                dest,
+                heuristic=manhattan,
+                weight=lambda u, v, d: self._dynamic_weight(u, v, d),
+            )
+            self.goal = dest
+            self.steps_since_plan = 0
+            print(f"[{self.label}] 🧭 planned path to {dest} (len={len(self.path)})")
+        except Exception as e:
+            print(f"[{self.label}] ❌ plan failed ({e}); fallback random")
+            self.path = []
+            self.goal = None
+
+    def _step_along_path(self):
+        """Advance one step along current path; returns (old,new)."""
+        if not self.path or self.path[0] != self.position:
+            # normalize: ensure current position is first
+            if self.path and self.position in self.path:
+                idx = self.path.index(self.position)
+                self.path = self.path[idx:]
+            else:
+                # no valid path containing current pos
+                return self._move_randomly()
+
+        if len(self.path) >= 2:
+            old = self.position
+            self.position = self.path[1]
+            self.path = self.path[1:]
+            self.steps_since_plan += 1
+            return old, self.position
+        else:
+            # already at goal; keep singleton so arrival check sees it
+            self.path = [self.position]
+            return self.position, self.position
+
+    def _move_randomly(self):
         neighbors = list(self.city.graph.neighbors(self.position))
-        if not neighbors:
-            return self.position
-        old_pos = self.position
-        self.position = random.choice(neighbors)
-        return old_pos, self.position
+        old = self.position
+        if neighbors:
+            self.position = random.choice(neighbors)
+        return old, self.position
 
-    def find_nearest_traffic_light(self):
-        """Return nearest traffic light based on path length."""
+    def _nearest_light_jid(self):
         lights = list(self.city.traffic_lights.values())
-        return min(lights, key=lambda l: nx.shortest_path_length(self.city.graph, self.position, l))
+        if not lights:
+            return "light1@localhost"
+        try:
+            best = min(lights, key=lambda l: nx.shortest_path_length(self.city.graph, self.position, l))
+            return f"light_{best[0]}_{best[1]}@localhost"
+        except Exception:
+            return "light1@localhost"
 
-    def nearby_vehicle_count(self, all_positions):
-        """Count nearby vehicles within one hop."""
-        neighbors = list(self.city.graph.neighbors(self.position))
-        return sum(1 for pos in all_positions if pos in neighbors)
-
-    # ---------------------------------------------------------------------
-    # Behaviour definition
-    # ---------------------------------------------------------------------
+    # ---------------- Behaviour ----------------
     class VehicleBehaviour(behaviour.PeriodicBehaviour):
+        async def on_start(self):
+            # pause only before first actual move (nice reveal)
+            self.first_run = True
+
         async def run(self):
-            # Move vehicle
-            old_pos, new_pos = self.agent.move_randomly()
-            print(f"[{self.agent.name}] 🚗 moved from {old_pos} → {new_pos}")
+            if self.first_run:
+                await asyncio.sleep(1.5)  # small cinematic pause
+                self.first_run = False
 
-            # Simple congestion detection
-            # (You can replace this with a shared state manager later)
-            all_positions = [self.agent.position]  # placeholder for nearby vehicles
-            nearby_count = self.agent.nearby_vehicle_count(all_positions)
+            # --- Arrival handling: pause, then pick a new destination ---
+            at_goal = (self.agent.goal is not None and self.agent.position == self.agent.goal)
+            singleton_here = (len(self.agent.path) == 1 and self.agent.path[0] == self.agent.position)
+            if at_goal or singleton_here:
+                print(f"[{self.agent.label}] ✅ Reached {self.agent.goal}, pausing 3s then choosing a new destination…")
+                await asyncio.sleep(3)
+                # reset so next tick will plan a fresh trip
+                self.agent.goal = None
+                self.agent.path = []
+                self.agent.steps_since_plan = 0
+                return
+            # ------------------------------------------------------------
 
-            if nearby_count >= 2:
-                msg = Message(to="reporter@localhost")
-                msg.set_metadata("type", "congestion_update")
-                msg.body = f"Congestion detected near {new_pos} ({nearby_count} vehicles)"
-                await self.send(msg)
-                print(f"[{self.agent.name}] 🚦 Reported congestion at {new_pos}")
+            # 1) Plan if no path / no goal / periodic replan
+            need_plan = (
+                (not self.agent.path)
+                or (self.agent.goal is None)
+                or (self.agent.steps_since_plan >= self.agent.replan_every)
+            )
 
-            # Request passage from nearest light
-            nearest_light = self.agent.find_nearest_traffic_light()
-            light_jid = f"light_{nearest_light[0]}_{nearest_light[1]}@localhost"
-            msg = Message(to=light_jid)
-            msg.set_metadata("type", "passage_request")
-            msg.body = f"{self.agent.name} at {new_pos} requests passage"
-            await self.send(msg)
-            print(f"[{self.agent.name}] 🚧 Requested passage from {light_jid}")
+            # 2) Incident-aware replan trigger (safe; won't block movement)
+            incident_near = False
+            try:
+                incident_msg = None
+                if USE_FILTERED_INCIDENTS and Template is not None:
+                    # Only consume messages explicitly tagged as incidents
+                    incident_msg = await self.receive(timeout=0.01, filter=Template(metadata={"type": "incident"}))
+                else:
+                    # Lightweight peek: only act if body clearly indicates an incident
+                    candidate = await self.receive(timeout=0.01)
+                    if candidate and isinstance(candidate.body, str) and "Accident reported near" in candidate.body:
+                        incident_msg = candidate
 
-            # Wait for reply
-            incoming = await self.receive(timeout=3)
+                if incident_msg and isinstance(incident_msg.body, str):
+                    import re
+                    m = re.search(r"\((\d+),\s*(\d+)\)", incident_msg.body)
+                    if m:
+                        p = (int(m.group(1)), int(m.group(2)))
+                        if manhattan(p, self.agent.position) <= 4:
+                            incident_near = True
+                            print(f"[{self.agent.label}] 🔁 Rerouting due to nearby incident at {p}")
+            except Exception as e:
+                # Never let incident parsing stop movement
+                print("[INCIDENT CHECK WARN]", e)
+
+            if need_plan or (incident_near and (self.agent.goal is not None) and (self.agent.position != self.agent.goal)):
+                if self.agent.goal is None:
+                    self.agent.goal = self.agent._choose_far_goal()
+                self.agent._plan_to(self.agent.goal)
+
+            # 3) Move: prefer path step, fallback to random if no path
+            old_pos, new_pos = (self.agent._step_along_path() if self.agent.path else self.agent._move_randomly())
+
+            # 4) Occupancy (optional, safe if not wired)
+            try:
+                if old_pos != new_pos:
+                    self.agent.city.occupancy.leave(old_pos, new_pos, self.agent.label)
+                    self.agent.city.occupancy.enter(old_pos, new_pos, self.agent.label)
+            except Exception as e:
+                print("[OCCUPANCY ERROR]", e)
+
+            # 5) Viewer update
+            try:
+                self.agent.shared.setdefault("vehicles", {})[self.agent.label] = self.agent.position
+            except Exception as e:
+                print("[VIS-WRITE vehicle tick ERROR]", e)
+
+            print(f"[{self.agent.label}] 🚗 moved {old_pos} → {new_pos} (goal={self.agent.goal})")
+
+            # 6) Ask nearest light; retry once if it was still booting
+            light_jid = self.agent._nearest_light_jid()
+            req = Message(to=light_jid)
+            req.set_metadata("type", "passage_request")
+            req.body = f"{self.agent.label} at {new_pos} requests passage"
+
+            await self.send(req)
+            incoming = await self.receive(timeout=0.8)
+            if not incoming:
+                await asyncio.sleep(0.4)
+                await self.send(req)
+                incoming = await self.receive(timeout=0.8)
+
             if incoming:
-                print(f"[{self.agent.name}] 📩 Received: {incoming.body}")
+                print(f"[{self.agent.label}] 📩 Received: {incoming.body}")
+            else:
+                print(f"[{self.agent.label}] ⚠️ No reply from {light_jid}")
 
-    # ---------------------------------------------------------------------
-    # Setup
-    # ---------------------------------------------------------------------
     async def setup(self):
-        print(f"[{self.name}] Vehicle agent initialized at {self.position}")
-        b = self.VehicleBehaviour(period=5)
-        self.add_behaviour(b)
+        print(f"[{self.label}] Vehicle agent initialized at {self.position}")
+        self.add_behaviour(self.VehicleBehaviour(period=1.0))  # 1 step per second
