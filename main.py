@@ -23,10 +23,14 @@ async def main():
     await v1.start(auto_register=True)
     await v2.start(auto_register=True)
     em = EmergencyVehicleAgent(
-    "emergency@localhost", "password", "Ambulance",
-    city, shared,
-    fixed_dest=city.hospitals["hospital_central"],  # <- (width//2, height//2)
-    pause_at_goal=2.0)
+        "emergency@localhost",
+        "password",
+        "Ambulance",
+        city,
+        shared,
+        fixed_dest=city.hospitals["hospital_central"],  # hospital node (x, y)
+        pause_at_goal=2.0,
+    )
 
     await em.start(auto_register=True)
 
