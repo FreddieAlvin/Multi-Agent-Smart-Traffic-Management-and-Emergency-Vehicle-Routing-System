@@ -40,12 +40,19 @@ class Occupancy:
     # Vehicle movement tracking
     # -------------------------------
     def enter(self, u, v, vehicle_id: str) -> None:
+        """Registers that a vehicle has entered the edge (u, v)."""
         edge = self._normalize_edge((u, v))
         self.road_usage[edge].add(vehicle_id)
 
     def leave(self, u, v, vehicle_id: str) -> None:
+        """Registers that a vehicle has left the edge (u, v)."""
         edge = self._normalize_edge((u, v))
         self.road_usage[edge].discard(vehicle_id)
+
+    def count(self, u, v) -> int:
+        """Returns the number of vehicles currently on the edge (u, v)."""
+        edge = self._normalize_edge((u, v))
+        return len(self.road_usage[edge])
 
     # -------------------------------
     # Density and smoothing
@@ -80,7 +87,7 @@ class Occupancy:
         """
         Estimate congestion around a node based on nearby edges within 'radius'.
         """
-        edges_nearby = []
+        edges_nearby: List[Tuple] = []
         for u, v in self.G.edges:
             if self._distance(position, u) <= radius or self._distance(position, v) <= radius:
                 edges_nearby.append((u, v))

@@ -3,7 +3,10 @@ from typing import Tuple, Dict, List
 
 
 class Incident:
-    """Represents an incident (e.g. roadblock, accident) on an edge of the city graph."""
+    """
+    Represents an incident (e.g. roadblock, accident) on an edge (u, v) of the city graph.
+    Stores its severity and time-to-live (TTL) until it disappears.
+    """
 
     def __init__(self, edge: Tuple, severity: float = 1.0, ttl: float = 30.0):
         self.edge = edge  # (u, v)
@@ -20,8 +23,10 @@ class Incident:
         return max(0.0, self.expires_at - time.time())
 
     def __repr__(self):
-        return (f"Incident(edge={self.edge}, severity={self.severity}, "
-                f"expires_in={self.remaining_time():.1f}s)")
+        return (
+            f"Incident(edge={self.edge}, severity={self.severity}, "
+            f"expires_in={self.remaining_time():.1f}s)"
+        )
 
 
 class EventManager:
@@ -54,7 +59,10 @@ class EventManager:
             existing = self.incidents[edge]
             existing.severity = max(existing.severity, severity)
             existing.expires_at = time.time() + ttl
-            print(f"⚠️  Updated incident on {edge}: severity={existing.severity}, ttl={ttl}s")
+            print(
+                f"⚠️  Updated incident on {edge}: "
+                f"severity={existing.severity}, ttl={ttl}s"
+            )
         else:
             self.incidents[edge] = Incident(edge, severity, ttl)
             print(f"🚧 New incident on {edge}: severity={severity}, ttl={ttl}s")
