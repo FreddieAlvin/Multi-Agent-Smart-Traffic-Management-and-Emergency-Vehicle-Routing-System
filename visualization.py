@@ -1,4 +1,3 @@
-# visualization.py
 import time
 import numpy as np
 import matplotlib.pyplot as plt
@@ -19,11 +18,17 @@ class Visualizer:
         nx.draw_networkx_edges(self.city.graph, pos, width=0.2, ax=self.ax)
         nx.draw_networkx_nodes(self.city.graph, pos, node_size=10, ax=self.ax)
 
-
-        # lights (static) — squares
-        if self.shared.get("lights"):
-            lx, ly = zip(*self.shared["lights"])
-            self.ax.scatter(lx, ly, marker="s", s=70, label="Lights", zorder=3)
+        # lights (static) — squares, a partir do city.traffic_lights
+        if self.city.traffic_lights:
+            lx, ly = zip(*self.city.traffic_lights.values())
+            self.light_scatter = self.ax.scatter(
+                lx, ly, marker="s", s=70, label="Lights", zorder=3
+            )
+        else:
+            # caso extremo em que não haja semáforos
+            self.light_scatter = self.ax.scatter(
+                [], [], marker="s", s=70, label="Lights", zorder=3
+            )
 
         # dynamic layers
         self.veh_scatter = self.ax.scatter([], [], s=80, label="Vehicles", zorder=4)

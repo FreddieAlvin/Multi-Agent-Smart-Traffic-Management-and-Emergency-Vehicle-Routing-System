@@ -3,6 +3,7 @@ import random
 import networkx as nx
 from spade import agent, behaviour
 from spade.message import Message
+import json  # for communication with traffic lights
 
 # If your IncidentReporter sets msg.set_metadata("type", "incident"), set this True.
 # If not, leave False and we'll fall back to a text-only peek that won't crash movement.
@@ -127,6 +128,64 @@ class VehicleAgent(agent.Agent):
         except Exception:
             return "light1@localhost"
 
+    def _peek_next_step(self):
+        """Look at the next step along the current path without committing movement.
+        Returns (old_pos, next_pos). May normalize the path so that path[0] == position."""
+        if not self.path or self.path[0] != self.position:
+            # normalize: ensure current position is first in the path
+            if self.path and self.position in self.path:
+                idx = self.path.index(self.position)
+                self.path = self.path[idx:]
+            else:
+                # no valid path containing current pos
+                return self.position, self.position
+
+        if len(self.path) >= 2:
+            return self.position, self.path[1]
+        else:
+            # already at goal; no movement
+            return self.position, self.position
+
+    def _light_jid_for(self, node):
+        """Return the JID of the traffic light located exactly at 'node', or None if none.
+        CityEnvironment.traffic_lights is a dict: id -> (x, y), where id is 'light_x_y'."""
+        for lid, pos in self.city.traffic_lights.items():
+            if pos == node:
+                return f"{lid}@localhost"
+        return None
+
+    async def _wait_for_green(self, from_pos, to_pos):
+        """Block until the traffic light at 'to_pos' grants passage for movement from
+        from_pos -> to_pos. If there is no traffic light at 'to_pos', returns immediately."""
+        light_jid = self._light_jid_for(to_pos)
+        if not light_jid:
+            # no traffic light controlling this node
+            return
+
+        while True:
+            req = Message(to=light_jid)
+            req.set_metadata("type", "passage_request")
+            req.body = json.dumps({"from": list(from_pos), "to": list(to_pos)})
+
+            await self.send(req)
+            incoming = await self.receive(timeout=0.8)
+
+            if not incoming:
+                print(f"[{self.label}] ⚠️ No reply from {light_jid}, retrying...")
+                await asyncio.sleep(0.4)
+                continue
+
+            granted_flag = incoming.metadata.get("granted", "false") if incoming.metadata else "false"
+            granted = granted_flag == "true"
+
+            print(f"[{self.label}] 📩 Traffic light reply: body={incoming.body}, granted={granted_flag}")
+
+            if granted:
+                return
+            else:
+                # red light: wait a bit and try again
+                await asyncio.sleep(0.5)
+
     # ---------------- Behaviour ----------------
     class VehicleBehaviour(behaviour.PeriodicBehaviour):
         async def on_start(self):
@@ -188,8 +247,29 @@ class VehicleAgent(agent.Agent):
                     self.agent.goal = self.agent._choose_far_goal()
                 self.agent._plan_to(self.agent.goal)
 
-            # 3) Move: prefer path step, fallback to random if no path
-            old_pos, new_pos = (self.agent._step_along_path() if self.agent.path else self.agent._move_randomly())
+            # 3) Move: prefer path step (with traffic light coordination), fallback to random if no path
+            if self.agent.path:
+                old_pos, candidate_new = self.agent._peek_next_step()
+                if old_pos != candidate_new:
+                    # Ask the traffic light (if any) controlling the target intersection
+                    await self.agent._wait_for_green(old_pos, candidate_new)
+
+                    # Commit movement along the path
+                    self.agent.position = candidate_new
+                    # Drop nodes up to the new position so path[0] == position
+                    if self.agent.position in self.agent.path:
+                        idx = self.agent.path.index(self.agent.position)
+                        self.agent.path = self.agent.path[idx:]
+                    else:
+                        self.agent.path = [self.agent.position]
+                    self.agent.steps_since_plan += 1
+
+                    new_pos = self.agent.position
+                else:
+                    # Path does not give a new move; fallback to random move
+                    old_pos, new_pos = self.agent._move_randomly()
+            else:
+                old_pos, new_pos = self.agent._move_randomly()
 
             # 4) Occupancy (optional, safe if not wired)
             try:
@@ -206,24 +286,6 @@ class VehicleAgent(agent.Agent):
                 print("[VIS-WRITE vehicle tick ERROR]", e)
 
             print(f"[{self.agent.label}] 🚗 moved {old_pos} → {new_pos} (goal={self.agent.goal})")
-
-            # 6) Ask nearest light; retry once if it was still booting
-            light_jid = self.agent._nearest_light_jid()
-            req = Message(to=light_jid)
-            req.set_metadata("type", "passage_request")
-            req.body = f"{self.agent.label} at {new_pos} requests passage"
-
-            await self.send(req)
-            incoming = await self.receive(timeout=0.8)
-            if not incoming:
-                await asyncio.sleep(0.4)
-                await self.send(req)
-                incoming = await self.receive(timeout=0.8)
-
-            if incoming:
-                print(f"[{self.agent.label}] 📩 Received: {incoming.body}")
-            else:
-                print(f"[{self.agent.label}] ⚠️ No reply from {light_jid}")
 
     async def setup(self):
         print(f"[{self.label}] Vehicle agent initialized at {self.position}")

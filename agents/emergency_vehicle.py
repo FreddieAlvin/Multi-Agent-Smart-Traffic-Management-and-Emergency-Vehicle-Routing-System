@@ -4,6 +4,7 @@ import random
 import networkx as nx
 from spade import agent, behaviour
 from spade.message import Message
+import json  # para falar com os semáforos em JSON
 
 
 def manhattan(a, b):
@@ -218,13 +219,12 @@ class EmergencyVehicleAgent(agent.Agent):
                 f"(goal={self.agent.goal}, phase={getattr(self.agent, 'phase', None)})"
             )
 
-            # Priority request to nearest light (retry once if booting)
+            # Priority request to nearest light (JSON body with from/to)
             light_jid = self.agent._nearest_light_jid()
             req = Message(to=light_jid)
             req.set_metadata("type", "priority_request")
-            req.body = (
-                f"Emergency vehicle {self.agent.label} at {new_pos} needs priority"
-            )
+            req.body = json.dumps({"from": list(old_pos), "to": list(new_pos)})
+
             await self.send(req)
             incoming = await self.receive(timeout=0.6)
             if not incoming:
@@ -233,7 +233,11 @@ class EmergencyVehicleAgent(agent.Agent):
                 incoming = await self.receive(timeout=0.6)
 
             if incoming:
-                print(f"[{self.agent.label}] 📩 Received: {incoming.body}")
+                granted_flag = incoming.metadata.get("granted", "false") if incoming.metadata else "false"
+                print(
+                    f"[{self.agent.label}] 📩 Traffic light reply: "
+                    f"body={incoming.body}, granted={granted_flag}"
+                )
             else:
                 print(f"[{self.agent.label}] ⚠️ No reply from {light_jid}")
 

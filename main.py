@@ -1,4 +1,3 @@
-# main.py
 import asyncio
 from agents.vehicle import VehicleAgent
 from agents.traffic_lights import TrafficLightAgent
@@ -7,11 +6,16 @@ from agents.incident_reporter import IncidentReporterAgent
 from environment.city import CityEnvironment
 from visualization import Visualizer
 
-# main.py (only the middle of main() changes)
 
 async def main():
     city = CityEnvironment()
-    shared = {"vehicles": {}, "emergency": {}, "lights": list(city.traffic_lights.values())}
+
+    # shared state para visualização
+    shared = {
+        "vehicles": {},
+        "emergency": {},
+        # já não precisamos de "lights" aqui; os semáforos vêm de city.traffic_lights
+    }
 
     # start the viewer
     vis = Visualizer(city, shared, refresh_hz=8)
@@ -22,6 +26,7 @@ async def main():
     v2 = VehicleAgent("vehicle2@localhost", "password", "Vehicle 2", city, shared)
     await v1.start(auto_register=True)
     await v2.start(auto_register=True)
+
     em = EmergencyVehicleAgent(
         "emergency@localhost",
         "password",
@@ -31,7 +36,6 @@ async def main():
         fixed_dest=city.hospitals["hospital_central"],  # hospital node (x, y)
         pause_at_goal=2.0,
     )
-
     await em.start(auto_register=True)
 
     reporter = IncidentReporterAgent("reporter@localhost", "password")
@@ -40,15 +44,16 @@ async def main():
     # --- START ALL GRID LIGHTS IN THE BACKGROUND (don’t block UI) ---
     async def start_grid_lights():
         light_agents, tasks = [], []
-        for (x, y) in city.traffic_lights.values():
-            jid = f"light_{x}_{y}@localhost"
+        for lid, (x, y) in city.traffic_lights.items():
+            # lid é algo como "light_4_8" → JID "light_4_8@localhost"
+            jid = f"{lid}@localhost"
             tl = TrafficLightAgent(jid, "password")
             light_agents.append(tl)
             tasks.append(tl.start(auto_register=True))
         await asyncio.gather(*tasks)
         print(f"[MAIN] started {len(light_agents)} traffic lights")
 
-    asyncio.create_task(start_grid_lights())  # <- kicks off, but we don't wait
+    asyncio.create_task(start_grid_lights())  # <- arranca sem bloquear o main
 
     print("🚦 Simulation + Viewer started")
 
@@ -57,6 +62,7 @@ async def main():
             await asyncio.sleep(1)
     except asyncio.CancelledError:
         pass
+
 
 if __name__ == "__main__":
     # NOTE: Run the SPADE server in another terminal:
