@@ -30,8 +30,13 @@ class EmergencyVehicleAgent(agent.Agent):
         self.city = city_env
         self.shared = shared or {"emergency": {}}
 
-        nodes = list(city_env.graph.nodes)
-        self.position = random.choice(nodes)
+        # Se tivermos hospital definido, começamos no hospital
+        # (cumpre o requisito: sair do hospital para destinos aleatórios)
+        if fixed_dest is not None:
+            self.position = fixed_dest
+        else:
+            nodes = list(city_env.graph.nodes)
+            self.position = random.choice(nodes)
 
         # Routing state
         self.fixed_dest = fixed_dest          # hospital
@@ -44,7 +49,7 @@ class EmergencyVehicleAgent(agent.Agent):
         if self.fixed_dest is not None and self.position != self.fixed_dest:
             self.phase = "to_hospital"
         else:
-            # if we spawn at hospital or no hospital set, start by going random
+            # se nascemos no hospital ou não houver hospital, começamos por ir para random
             self.phase = "to_random"
 
         # visible immediately
@@ -80,6 +85,15 @@ class EmergencyVehicleAgent(agent.Agent):
 
     # ---------- plan/step ----------
     def _plan_to(self, dest):
+        """
+        Planeia um caminho A* até dest.
+        Aqui também registamos um replaneamento nas métricas, se existirem.
+        """
+        # Log de replaneamento (cada A* conta como replan)
+        metrics = getattr(self.city, "metrics", None)
+        if metrics is not None:
+            metrics.log_replan(self.label)
+
         try:
             self.path = nx.astar_path(
                 self.city.graph,
@@ -156,6 +170,17 @@ class EmergencyVehicleAgent(agent.Agent):
             )
             if at_goal or singleton_here:
                 print(f"[{self.agent.label}] ✅ Reached goal {self.agent.goal}")
+
+                # Se chegámos a um destino ALEATÓRIO (não hospital),
+                # consideramos que a resposta à emergência terminou.
+                metrics = getattr(self.agent.city, "metrics", None)
+                if (
+                    metrics is not None
+                    and self.agent.fixed_dest is not None
+                    and self.agent.position != self.agent.fixed_dest
+                ):
+                    metrics.end_emergency()
+
                 await asyncio.sleep(self.agent.pause_at_goal)
 
                 # Toggle phase: hospital <-> random, if a hospital is defined
@@ -176,6 +201,8 @@ class EmergencyVehicleAgent(agent.Agent):
             # --- Planning: only when we don't have a valid path/goal ---
             need_plan = (not self.agent.path) or (self.agent.goal is None)
             if need_plan:
+                metrics = getattr(self.agent.city, "metrics", None)
+
                 if self.agent.fixed_dest is not None:
                     # ensure phase is valid
                     if not hasattr(self.agent, "phase") or self.agent.phase not in {
@@ -190,6 +217,13 @@ class EmergencyVehicleAgent(agent.Agent):
                         dest = self.agent.fixed_dest
                     else:  # to_random
                         dest = self.agent._choose_far_goal()
+                        # Vamos assumir que a "resposta de emergência" começa
+                        # quando sai do hospital para ir para um ponto aleatório.
+                        if (
+                            metrics is not None
+                            and self.agent.position == self.agent.fixed_dest
+                        ):
+                            metrics.start_emergency()
                 else:
                     # No fixed hospital: just patrol like a normal emergency vehicle
                     dest = self.agent._choose_far_goal()
@@ -233,7 +267,11 @@ class EmergencyVehicleAgent(agent.Agent):
                 incoming = await self.receive(timeout=0.6)
 
             if incoming:
-                granted_flag = incoming.metadata.get("granted", "false") if incoming.metadata else "false"
+                granted_flag = (
+                    incoming.metadata.get("granted", "false")
+                    if incoming.metadata
+                    else "false"
+                )
                 print(
                     f"[{self.agent.label}] 📩 Traffic light reply: "
                     f"body={incoming.body}, granted={granted_flag}"

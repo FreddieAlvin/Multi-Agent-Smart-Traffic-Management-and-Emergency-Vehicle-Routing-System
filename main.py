@@ -14,15 +14,21 @@ from utils.metrics import Metrics
 
 async def main():
     # ---------------------------------------------------
-    # INIT CITY + SHARED STATE + VISUALIZER
+    # INIT METRICS + CITY + SHARED STATE + VISUALIZER
     # ---------------------------------------------------
-    city = CityEnvironment()
+    # Objeto de métricas (ficheiro pode ser ajustado se quiseres outro nome)
+    metrics = Metrics(filename="metrics.csv")
+
+    # Passamos as métricas para o ambiente (city.py deve aceitar metrics=None por omissão)
+    city = CityEnvironment(metrics=metrics)
 
     # Estado global para visualização no Visualizer
     shared = {
         "vehicles": {},
         "emergency": {},
-        # semáforos vêm do city.traffic_lights
+        # podes adicionar "lights" aqui se o Visualizer usar isso
+        # "lights": list(city.traffic_lights.values()),
+        "metrics": metrics,
     }
 
     # Viewer (não bloqueia o main)
@@ -37,14 +43,14 @@ async def main():
         "password",
         "Vehicle 1",
         city,
-        shared
+        shared,
     )
     v2 = VehicleAgent(
         "vehicle2@localhost",
         "password",
         "Vehicle 2",
         city,
-        shared
+        shared,
     )
 
     await v1.start(auto_register=True)
@@ -95,7 +101,21 @@ async def main():
         while True:
             await asyncio.sleep(1)
     except asyncio.CancelledError:
+        # Se a tarefa for cancelada por algum motivo
         pass
+    finally:
+        # Antes de terminar, guardar as métricas em disco
+        try:
+            summary = metrics.summary()
+            print("[MAIN] Metrics summary:", summary)
+        except Exception as e:
+            print(f"[MAIN] Error computing metrics summary: {e}")
+
+        try:
+            metrics.save()
+            print("[MAIN] Metrics saved to", metrics.filename)
+        except Exception as e:
+            print(f"[MAIN] Error saving metrics: {e}")
 
 
 if __name__ == "__main__":
