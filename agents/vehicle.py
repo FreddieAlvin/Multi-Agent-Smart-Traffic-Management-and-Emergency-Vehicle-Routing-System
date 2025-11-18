@@ -239,8 +239,6 @@ class VehicleAgent(agent.Agent):
                 # red light / reject-proposal: wait then retry
                 await asyncio.sleep(0.5)
 
-
-
         async def run(self):
             if self.first_run:
                 await asyncio.sleep(1.5)  # small cinematic pause

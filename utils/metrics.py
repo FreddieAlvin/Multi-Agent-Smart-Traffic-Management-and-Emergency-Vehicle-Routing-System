@@ -16,6 +16,8 @@ class Metrics:
         self._ev_start = None      # start_time of the emergency
         self.records = []          # list of dicts (CSV rows)
         self._rho_snapshots = []   # float values (0..1)
+                # contagem de replans (planeamentos de rota)
+        self.total_replans = 0
 
     # ---------- Vehicle trips ----------
     def start_trip(self, vehicle_id: str) -> None:
@@ -45,6 +47,15 @@ class Metrics:
     def log_congestion(self, avg_rho: float) -> None:
         """Stores a single average congestion reading (0..1)."""
         self._rho_snapshots.append(float(avg_rho))
+
+    # ---------- Replans ----------
+    def log_replan(self, vehicle_id: str) -> None:
+        """
+        Regista que um agente replaneou a rota.
+        Chamado em VehicleAgent._plan_to(...) e EmergencyVehicleAgent._plan_to(...).
+        """
+        self.total_replans += 1
+
 
     # ---------- Persistence ----------
     def save(self) -> None:

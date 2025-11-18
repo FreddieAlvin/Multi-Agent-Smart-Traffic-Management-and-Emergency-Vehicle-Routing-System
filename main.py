@@ -19,15 +19,16 @@ async def main():
     # Objeto de métricas (ficheiro pode ser ajustado se quiseres outro nome)
     metrics = Metrics(filename="metrics.csv")
 
-    # Passamos as métricas para o ambiente (city.py deve aceitar metrics=None por omissão)
-    city = CityEnvironment(metrics=metrics)
+    # Criamos a city normalmente
+    city = CityEnvironment()
+    # E depois penduramos o objeto de métricas à mão
+    city.metrics = metrics
 
     # Estado global para visualização no Visualizer
     shared = {
         "vehicles": {},
         "emergency": {},
-        # podes adicionar "lights" aqui se o Visualizer usar isso
-        # "lights": list(city.traffic_lights.values()),
+        "lights": list(city.traffic_lights.values()),
         "metrics": metrics,
     }
 
@@ -88,7 +89,7 @@ async def main():
 
         for lid, (x, y) in city.traffic_lights.items():
             jid = f"{lid}@localhost"
-            tl = TrafficLightAgent(jid, "password", city_env=city, shared=shared)
+            tl = TrafficLightAgent(jid, "password")
             light_agents.append(tl)
             tasks.append(tl.start(auto_register=True))
 
