@@ -4,6 +4,7 @@ import random
 import networkx as nx
 from spade import agent, behaviour
 from spade.message import Message
+import json  # para falar com os semáforos em JSON
 
 
 def manhattan(a, b):
@@ -29,8 +30,13 @@ class EmergencyVehicleAgent(agent.Agent):
         self.city = city_env
         self.shared = shared or {"emergency": {}}
 
-        nodes = list(city_env.graph.nodes)
-        self.position = random.choice(nodes)
+        # Se tivermos hospital definido, começamos no hospital
+        # (cumpre o requisito: sair do hospital para destinos aleatórios)
+        if fixed_dest is not None:
+            self.position = fixed_dest
+        else:
+            nodes = list(city_env.graph.nodes)
+            self.position = random.choice(nodes)
 
         # Routing state
         self.fixed_dest = fixed_dest          # hospital
@@ -43,7 +49,7 @@ class EmergencyVehicleAgent(agent.Agent):
         if self.fixed_dest is not None and self.position != self.fixed_dest:
             self.phase = "to_hospital"
         else:
-            # if we spawn at hospital or no hospital set, start by going random
+            # se nascemos no hospital ou não houver hospital, começamos por ir para random
             self.phase = "to_random"
 
         # visible immediately
@@ -79,6 +85,15 @@ class EmergencyVehicleAgent(agent.Agent):
 
     # ---------- plan/step ----------
     def _plan_to(self, dest):
+        """
+        Planeia um caminho A* até dest.
+        Aqui também registamos um replaneamento nas métricas, se existirem.
+        """
+        # Log de replaneamento (cada A* conta como replan)
+        metrics = getattr(self.city, "metrics", None)
+        if metrics is not None:
+            metrics.log_replan(self.label)
+
         try:
             self.path = nx.astar_path(
                 self.city.graph,
@@ -155,6 +170,17 @@ class EmergencyVehicleAgent(agent.Agent):
             )
             if at_goal or singleton_here:
                 print(f"[{self.agent.label}] ✅ Reached goal {self.agent.goal}")
+
+                # Se chegámos a um destino ALEATÓRIO (não hospital),
+                # consideramos que a resposta à emergência terminou.
+                metrics = getattr(self.agent.city, "metrics", None)
+                if (
+                    metrics is not None
+                    and self.agent.fixed_dest is not None
+                    and self.agent.position != self.agent.fixed_dest
+                ):
+                    metrics.end_emergency()
+
                 await asyncio.sleep(self.agent.pause_at_goal)
 
                 # Toggle phase: hospital <-> random, if a hospital is defined
@@ -175,6 +201,8 @@ class EmergencyVehicleAgent(agent.Agent):
             # --- Planning: only when we don't have a valid path/goal ---
             need_plan = (not self.agent.path) or (self.agent.goal is None)
             if need_plan:
+                metrics = getattr(self.agent.city, "metrics", None)
+
                 if self.agent.fixed_dest is not None:
                     # ensure phase is valid
                     if not hasattr(self.agent, "phase") or self.agent.phase not in {
@@ -189,6 +217,13 @@ class EmergencyVehicleAgent(agent.Agent):
                         dest = self.agent.fixed_dest
                     else:  # to_random
                         dest = self.agent._choose_far_goal()
+                        # Vamos assumir que a "resposta de emergência" começa
+                        # quando sai do hospital para ir para um ponto aleatório.
+                        if (
+                            metrics is not None
+                            and self.agent.position == self.agent.fixed_dest
+                        ):
+                            metrics.start_emergency()
                 else:
                     # No fixed hospital: just patrol like a normal emergency vehicle
                     dest = self.agent._choose_far_goal()
@@ -202,6 +237,41 @@ class EmergencyVehicleAgent(agent.Agent):
                 else self.agent._move_randomly()
             )
 
+            # --- COLLISION AVOIDANCE ---
+            all_vehicles = self.agent.shared.get("vehicles", {})
+            all_emergency = self.agent.shared.get("emergency", {})
+
+            hospital = getattr(self.agent, "fixed_dest", None)
+            at_hospital = (hospital is not None and new_pos == hospital)
+
+            occupied_by_vehicle = any(
+                pos == new_pos for name, pos in all_vehicles.items()
+            )
+            occupied_by_other_ambulance = any(
+                pos == new_pos and name != self.agent.label
+                for name, pos in all_emergency.items()
+            )
+
+            # Rule:
+            # - vehicles always block
+            # - other ambulances block everywhere EXCEPT at the hospital node
+            must_block = occupied_by_vehicle or (
+                occupied_by_other_ambulance and not at_hospital
+            )
+
+            if must_block:
+                print(
+                    f"[{self.agent.label}] ⛔ target {new_pos} occupied, "
+                    f"staying at {old_pos} and replanning next tick"
+                )
+                self.agent.position = old_pos
+                new_pos = old_pos
+
+                # force replan on next tick
+                self.agent.path = []
+                self.agent.goal = None
+                self.agent.steps_since_plan = 0
+
             # Update viewer + occupancy
             try:
                 if old_pos != new_pos:
@@ -213,18 +283,12 @@ class EmergencyVehicleAgent(agent.Agent):
             except Exception as e:
                 print("[EMERGENCY UPDATE WARN]", e)
 
-            print(
-                f"[{self.agent.label}] 🚑 moved {old_pos} → {new_pos} "
-                f"(goal={self.agent.goal}, phase={getattr(self.agent, 'phase', None)})"
-            )
-
-            # Priority request to nearest light (retry once if booting)
+            # Priority request to nearest light (JSON body with from/to)
             light_jid = self.agent._nearest_light_jid()
             req = Message(to=light_jid)
             req.set_metadata("type", "priority_request")
-            req.body = (
-                f"Emergency vehicle {self.agent.label} at {new_pos} needs priority"
-            )
+            req.body = json.dumps({"from": list(old_pos), "to": list(new_pos)})
+
             await self.send(req)
             incoming = await self.receive(timeout=0.6)
             if not incoming:
@@ -233,7 +297,15 @@ class EmergencyVehicleAgent(agent.Agent):
                 incoming = await self.receive(timeout=0.6)
 
             if incoming:
-                print(f"[{self.agent.label}] 📩 Received: {incoming.body}")
+                granted_flag = (
+                    incoming.metadata.get("granted", "false")
+                    if incoming.metadata
+                    else "false"
+                )
+                print(
+                    f"[{self.agent.label}] 📩 Traffic light reply: "
+                    f"body={incoming.body}, granted={granted_flag}"
+                )
             else:
                 print(f"[{self.agent.label}] ⚠️ No reply from {light_jid}")
 
