@@ -1,4 +1,3 @@
-# traffic_lights.py
 import asyncio
 import json
 from spade import agent, behaviour
@@ -90,50 +89,60 @@ class TrafficLightAgent(agent.Agent):
 
             mtype = msg.metadata.get("type") if msg.metadata else None
 
-            if mtype in ("passage_request", "priority_request"):
-                # Esperamos que o body venha em JSON com { "from": [x,y], "to": [x,y] }
-                try:
-                    payload = json.loads(msg.body)
-                    from_pos = tuple(payload["from"])
-                    to_pos = tuple(payload["to"])
-                except Exception:
-                    # se o formato vier diferente, loga e nega (para não rebentar)
-                    print(
-                        f"[Traffic Light {self.agent.jid}] ⚠️ Invalid message body: "
-                        f"{msg.body}"
-                    )
-                    await self._reply(msg, granted=False, reason="invalid_body")
-                    return
-
-                # Emergência: pode sempre passar
-                if mtype == "priority_request":
-                    print(
-                        f"[Traffic Light {self.agent.jid}] 🚑 Priority request "
-                        f"{from_pos}->{to_pos} -> GRANTED"
-                    )
-                    await self._reply(msg, granted=True, reason="emergency")
-                    return
-
-                # Veículo normal: verificar direção vs fase atual
-                d = direction(from_pos, to_pos)
-                if d is None:
-                    print(
-                        f"[Traffic Light {self.agent.jid}] ❌ Unknown direction "
-                        f"{from_pos}->{to_pos}"
-                    )
-                    await self._reply(msg, granted=False, reason="unknown_direction")
-                    return
-
-                allowed_dirs = ALLOWED_BY_PHASE[self.agent.phase]
-                granted = d in allowed_dirs
-
+            # Esperamos que o body venha em JSON com { "from": [x,y], "to": [x,y] }
+            try:
+                payload = json.loads(msg.body)
+                from_pos = tuple(payload["from"])
+                to_pos = tuple(payload["to"])
+            except Exception:
+                # se o formato vier diferente, loga e nega (para não rebentar)
                 print(
-                    f"[Traffic Light {self.agent.jid}] 🚗 Request {from_pos}->{to_pos} "
-                    f"dir={d} phase={self.agent.phase} allowed={allowed_dirs} -> "
-                    f"{'GRANTED' if granted else 'DENIED'}"
+                    f"[Traffic Light {self.agent.jid}] ⚠️ Invalid message body: "
+                    f"{msg.body}"
                 )
+                await self._reply(msg, granted=False, reason="invalid_body")
+                return
 
-                await self._reply(msg, granted=granted, reason="phase_check")
+            # Emergência: pode sempre passar
+            if mtype == "priority_request":
+                print(
+                    f"[Traffic Light {self.agent.jid}] 🚑 Priority request "
+                    f"{from_pos}->{to_pos} -> GRANTED"
+                )
+                await self._reply(msg, granted=True, reason="emergency")
+                return
+
+            # Veículo normal: verificar direção vs fase atual
+            d = direction(from_pos, to_pos)
+            if d is None:
+                print(
+                    f"[Traffic Light {self.agent.jid}] ❌ Unknown direction "
+                    f"{from_pos}->{to_pos}"
+                )
+                await self._reply(msg, granted=False, reason="unknown_direction")
+                return
+
+            allowed_dirs = ALLOWED_BY_PHASE[self.agent.phase]
+            granted = d in allowed_dirs
+            reason = "phase_check"
+
+            # NOVO: verifica se a estrada está bloqueada
+            if getattr(self.agent.city, "event_manager", None):
+                edge = (from_pos, to_pos)
+                if self.agent.city.event_manager.is_blocked(edge):
+                    granted = False
+                    reason = "blocked_by_incident"
+                    print(
+                        f"[Traffic Light {self.agent.jid}] 🚧 Edge {edge} blocked by incident -> DENIED"
+                    )
+
+            print(
+                f"[Traffic Light {self.agent.jid}] 🚗 Request {from_pos}->{to_pos} "
+                f"dir={d} phase={self.agent.phase} allowed={allowed_dirs} -> "
+                f"{'GRANTED' if granted else 'DENIED'} (reason={reason})"
+            )
+
+            await self._reply(msg, granted=granted, reason=reason)
 
         async def _reply(self, msg, granted: bool, reason: str = ""):
             """Responder ao veículo / ambulância com semântica tipo Contract Net."""
@@ -159,6 +168,8 @@ class TrafficLightAgent(agent.Agent):
                 reply.set_metadata("reason", reason)
             reply.body = "granted" if granted else "denied"
             await self.send(reply)
+            await asyncio.sleep(1.5)  # slows the loop
+
 
     async def setup(self):
         print(f"Traffic Light Agent {self.jid} ready")

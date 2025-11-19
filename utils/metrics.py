@@ -1,6 +1,9 @@
 import csv
 import time
 from statistics import mean
+import os
+import matplotlib.pyplot as plt
+
 
 class Metrics:
     """
@@ -97,3 +100,162 @@ class Metrics:
             "avg_rho": self.avg_rho(),
             "n_trips": len([r for r in self.records if r["type"] == "trip"]),
         }
+        
+    # ---------- plotting helpers ----------
+
+    def _save_hist(self, values, title, xlabel, filename, bins=20):
+        if not values:
+            return
+
+        vals = list(values)
+        vals.sort()
+
+        # Handle extreme outliers: clip at 95th percentile for visualization
+        import math
+        n = len(vals)
+        p95 = vals[int(0.95 * (n - 1))] if n > 1 else vals[0]
+        vmin = vals[0]
+        vmax = p95 if p95 > vmin else vals[-1]
+
+        plt.figure(figsize=(6, 4))
+        plt.hist(vals, bins=bins, range=(vmin, vmax), density=False, edgecolor="black")
+
+        # Mean & median lines to make the plot more informative
+        from statistics import mean, median
+        m = mean(vals)
+        med = median(vals)
+        plt.axvline(m, linestyle="--", linewidth=1, label=f"mean={m:.1f}")
+        plt.axvline(med, linestyle=":", linewidth=1, label=f"median={med:.1f}")
+
+        plt.title(title)
+        plt.xlabel(xlabel)
+        plt.ylabel("Frequency")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(filename)
+        plt.close()
+
+
+    def _save_series(self, values, title, ylabel, filename):
+        if not values:
+            return
+        plt.figure()
+        plt.plot(range(len(values)), values)
+        plt.title(title)
+        plt.xlabel("Index")
+        plt.ylabel(ylabel)
+        plt.tight_layout()
+        plt.savefig(filename)
+        plt.close()
+
+    def _save_ecdf(self, values, title, xlabel, filename):
+        """Empirical CDF: sorted values vs cumulative prob."""
+        if not values:
+            return
+        vals = sorted(values)
+        n = len(vals)
+        y = [i / (n - 1) if n > 1 else 1.0 for i in range(n)]
+        plt.figure()
+        plt.step(vals, y, where="post")
+        plt.title(title)
+        plt.xlabel(xlabel)
+        plt.ylabel("Cumulative probability")
+        plt.tight_layout()
+        plt.savefig(filename)
+        plt.close()
+
+    def _save_box(self, values, title, ylabel, filename):
+        if not values:
+            return
+        plt.figure()
+        plt.boxplot(values, vert=True, showmeans=True)
+        plt.title(title)
+        plt.ylabel(ylabel)
+        plt.tight_layout()
+        plt.savefig(filename)
+        plt.close()
+
+    def save_plots(self, prefix: str | None = None):
+        """
+        Gera vários gráficos em PNG a partir das métricas recolhidas.
+        Cria, por exemplo:
+          - <base>_trip_hist.png
+          - <base>_trip_ecdf.png
+          - <base>_trip_box.png
+          - <base>_ev_hist.png
+          - <base>_ev_ecdf.png
+          - <base>_rho_series.png
+          - <base>_rho_hist.png
+        """
+        if prefix is None:
+            base = os.path.splitext(self.filename)[0]  # "metrics.csv" -> "metrics"
+        else:
+            base = prefix
+
+        # --- trip times ---
+        trips = [r["value"] for r in self.records if r["type"] == "trip"]
+        if trips:
+            self._save_hist(
+                trips,
+                title="Trip time distribution",
+                xlabel="Trip time (s)",
+                filename=f"{base}_trip_hist.png",
+                bins=20,
+            )
+            self._save_ecdf(
+                trips,
+                title="Trip time CDF",
+                xlabel="Trip time (s)",
+                filename=f"{base}_trip_ecdf.png",
+            )
+            self._save_box(
+                trips,
+                title="Trip time spread",
+                ylabel="Trip time (s)",
+                filename=f"{base}_trip_box.png",
+            )
+            self._save_series(
+                trips,
+                title="Trip times over completed trips",
+                ylabel="Trip time (s)",
+                filename=f"{base}_trip_series.png",
+            )
+
+        # --- emergency response times ---
+        ev_times = [r["value"] for r in self.records if r["type"] == "ev_response"]
+        if ev_times:
+            self._save_hist(
+                ev_times,
+                title="Emergency response time distribution",
+                xlabel="Response time (s)",
+                filename=f"{base}_ev_hist.png",
+                bins=max(5, min(20, len(ev_times))),
+            )
+            self._save_ecdf(
+                ev_times,
+                title="Emergency response time CDF",
+                xlabel="Response time (s)",
+                filename=f"{base}_ev_ecdf.png",
+            )
+            self._save_box(
+                ev_times,
+                title="Emergency response spread",
+                ylabel="Response time (s)",
+                filename=f"{base}_ev_box.png",
+            )
+
+        # --- congestion (rho) ---
+        if getattr(self, "_rho_snapshots", None):
+            self._save_series(
+                self._rho_snapshots,
+                title="Average congestion (rho) over time",
+                ylabel="rho",
+                filename=f"{base}_rho_series.png",
+            )
+            self._save_hist(
+                self._rho_snapshots,
+                title="Distribution of congestion (rho)",
+                xlabel="rho",
+                filename=f"{base}_rho_hist.png",
+                bins=15,
+            )

@@ -1,14 +1,11 @@
+# main.py
 import asyncio
 from agents.vehicle import VehicleAgent
 from agents.traffic_lights import TrafficLightAgent
 from agents.emergency_vehicle import EmergencyVehicleAgent
 from agents.incident_reporter import IncidentReporterAgent
 from environment.city import CityEnvironment
-from visualization import Visualizer
-
-# New environment modules (importados caso precises deles noutros lados)
-from environment.occupancy import Occupancy
-from environment.events import EventManager
+from environment.visualization import Visualizer
 from utils.metrics import Metrics
 
 
@@ -16,15 +13,10 @@ async def main():
     # ---------------------------------------------------
     # INIT METRICS + CITY + SHARED STATE + VISUALIZER
     # ---------------------------------------------------
-    # Objeto de métricas (ficheiro pode ser ajustado se quiseres outro nome)
     metrics = Metrics(filename="metrics.csv")
-
-    # Criamos a city normalmente
     city = CityEnvironment()
-    # E depois penduramos o objeto de métricas à mão
     city.metrics = metrics
 
-    # Estado global para visualização no Visualizer
     shared = {
         "vehicles": {},
         "emergency": {},
@@ -32,85 +24,92 @@ async def main():
         "metrics": metrics,
     }
 
-    # Viewer (não bloqueia o main)
-    vis = Visualizer(city, shared, refresh_hz=8)
+    vis = Visualizer(city, shared, refresh_hz=4)
     asyncio.create_task(vis.update_loop())
 
     # ---------------------------------------------------
-    # START MULTIPLE VEHICLES AND EMERGENCY VEHICLES
+    # BUILD ALL AGENT INSTANCES (no starts yet)
     # ---------------------------------------------------
-    # --- Normal Vehicles ---
+
+    # Vehicles
     vehicles = []
-    for i in range(1, 11):   # vehicle1 .. vehicle5
+    for i in range(1, 11):   # vehicle1 .. vehicle10
+        jid = f"vehicle{i}@localhost"
         v = VehicleAgent(
-            f"vehicle{i}@localhost",
+            jid,
             "password",
             f"Vehicle {i}",
             city,
             shared,
         )
         vehicles.append(v)
+        city.vehicle_jids.append(jid)
 
-    # start them
-    for v in vehicles:
-        await v.start(auto_register=True)
-
-    # --- Emergency Vehicles (2 ambulances) ---
+    # Emergency vehicles
     ambulances = []
-    for i in range(1, 11):  # emergency1, emergency2
+    for i in range(1, 6):  # emergency1 .. emergency5
+        jid = f"emergency{i}@localhost"
         em = EmergencyVehicleAgent(
-            f"emergency{i}@localhost",
+            jid,
             "password",
             f"Ambulance {i}",
             city,
             shared,
-            fixed_dest=city.hospitals["hospital_central"],
-            pause_at_goal=2.0,
+            fixed_dest=None,
+            pause_at_goal=3.0,
         )
         ambulances.append(em)
 
-    # start ambulances
-    for em in ambulances:
-        await em.start(auto_register=True)
+    # Traffic lights
+    light_agents = []
+    for lid, (x, y) in city.traffic_lights.items():
+        jid = f"{lid}@localhost"
+        tl = TrafficLightAgent(jid, "password", city_env=city, shared=shared)
+        light_agents.append(tl)
 
-
-    # ---------------------------------------------------
-    # INCIDENT REPORTER
-    # ---------------------------------------------------
-    reporter = IncidentReporterAgent("reporter@localhost", "password")
-    await reporter.start(auto_register=True)
-
-    # ---------------------------------------------------
-    # START ALL GRID TRAFFIC LIGHTS (NON-BLOCKING)
-    # ---------------------------------------------------
-    async def start_grid_lights():
-        light_agents = []
-        tasks = []
-
-        for lid, (x, y) in city.traffic_lights.items():
-            jid = f"{lid}@localhost"
-            tl = TrafficLightAgent(jid, "password")
-            light_agents.append(tl)
-            tasks.append(tl.start(auto_register=True))
-
-        await asyncio.gather(*tasks)
-        print(f"[MAIN] Started {len(light_agents)} traffic lights.")
-
-    asyncio.create_task(start_grid_lights())
-
-    print("🚦 Simulation + Viewer started")
+    # Incident reporter
+    reporter = IncidentReporterAgent(
+        "reporter@localhost",
+        "password",
+        city,
+        city.event_manager,
+    )
 
     # ---------------------------------------------------
-    # MAIN LOOP (KEEPS SIMULATION RUNNING)
+    # START *EVERYTHING* CONCURRENTLY
+    # ---------------------------------------------------
+    start_coros = []
+    start_coros += [v.start(auto_register=True) for v in vehicles]
+    start_coros += [em.start(auto_register=True) for em in ambulances]
+    start_coros += [tl.start(auto_register=True) for tl in light_agents]
+    start_coros.append(reporter.start(auto_register=True))
+
+    await asyncio.gather(*start_coros)
+
+    print(f"[MAIN] Started {len(light_agents)} traffic lights.")
+    print(f"[MAIN] Started {len(vehicles)} vehicles.")
+    print(f"[MAIN] Started {len(ambulances)} emergency vehicles.")
+    print("🚦 Simulation + Viewer started with Incident Reporter.")
+
+    # ---------------------------------------------------
+    # START RANDOM ROADBLOCK LOOP (AFTER AGENTS ARE LIVE)
+    # ---------------------------------------------------
+    async def delayed_roadblocks():
+        # small delay so you see "clean" traffic first; tweak if you want
+        await city.random_roadblocks_loop(interval=3.0, ttl=8.0, max_blocks=3)
+
+    asyncio.create_task(delayed_roadblocks())
+
+    # ---------------------------------------------------
+    # MAIN LOOP
     # ---------------------------------------------------
     try:
         while True:
             await asyncio.sleep(1)
     except asyncio.CancelledError:
-        # Se a tarefa for cancelada por algum motivo
         pass
     finally:
-        # Antes de terminar, guardar as métricas em disco
+        # Save metrics
         try:
             summary = metrics.summary()
             print("[MAIN] Metrics summary:", summary)
@@ -123,10 +122,12 @@ async def main():
         except Exception as e:
             print(f"[MAIN] Error saving metrics: {e}")
 
+        try:
+            metrics.save_plots()
+            print("[MAIN] Metric plots saved as PNG files.")
+        except Exception as e:
+            print(f"[MAIN] Error saving metric plots: {e}")
+
 
 if __name__ == "__main__":
-    # Para correr:
-    #   spade run --host 127.0.0.1
-    # Depois:
-    #   python -u main.py
     asyncio.run(main())

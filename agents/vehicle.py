@@ -37,7 +37,7 @@ class VehicleAgent(agent.Agent):
         self.steps_since_plan = 0
         self.replan_every = 10      # periodic replan safety net
 
-        # visível imediatamente no viewer
+        # Initialize shared occupancy
         try:
             self.shared.setdefault("vehicles", {})[self.label] = self.position
         except Exception as e:
@@ -45,57 +45,40 @@ class VehicleAgent(agent.Agent):
 
     # ---------------- Helpers ----------------
     def _dynamic_weight(self, u, v, d):
-        """
-        Edge cost used by A*:
-          base = 1
-          + occupancy term (if available)
-          + incident penalty (if available)
-        """
         base = d.get("weight", 1.0)
 
         # occupancy
         try:
-            occ = self.city.occupancy.edge_density(u, v)  # 0..?
+            occ = self.city.occupancy.edge_density(u, v)
         except Exception:
             occ = 0.0
 
-        # incidents
+        # incidents / roadblocks
         try:
-            pen = self.city.event_manager.edge_penalty(u, v)  # 0..?
+            pen = self.city.event_manager.edge_penalty(u, v)
         except Exception:
             pen = 0.0
 
         return base + 0.6 * occ + pen
 
     def _choose_far_goal(self):
-        """Pick a goal 'far enough' (Manhattan >= 8), not equal to here."""
         here = self.position
-        candidates = [
-            n for n in self.city.graph.nodes
-            if n != here and manhattan(n, here) >= 8
-        ]
+        candidates = [n for n in self.city.graph.nodes if n != here and manhattan(n, here) >= 8]
         if not candidates:
             candidates = [n for n in self.city.graph.nodes if n != here]
         return random.choice(candidates) if candidates else here
 
     def _plan_to(self, dest):
-        """
-        Plan a path to 'dest' using A* with dynamic weights.
-        Cada chamada conta como um replaneamento nas métricas (se existirem).
-        """
-        # Log de replaneamento (cada chamada a A* conta como 1 replan)
         metrics = getattr(self.city, "metrics", None)
         if metrics is not None:
             metrics.log_replan(self.label)
-
         try:
-            # A* with dynamic edge weight
             self.path = nx.astar_path(
                 self.city.graph,
                 self.position,
                 dest,
                 heuristic=manhattan,
-                weight=lambda u, v, d: self._dynamic_weight(u, v, d),
+                weight=lambda u, v, d: self._dynamic_weight(u, v, d)
             )
             self.goal = dest
             self.steps_since_plan = 0
@@ -106,24 +89,28 @@ class VehicleAgent(agent.Agent):
             self.goal = None
 
     def _step_along_path(self):
-        """Advance one step along current path; returns (old,new)."""
         if not self.path or self.path[0] != self.position:
-            # normalize: ensure current position is first
             if self.path and self.position in self.path:
                 idx = self.path.index(self.position)
                 self.path = self.path[idx:]
             else:
-                # no valid path containing current pos
                 return self._move_randomly()
 
         if len(self.path) >= 2:
+            next_edge = (self.path[0], self.path[1])
+            # check for blocked edges / incidents
+            if self.city.event_manager.is_blocked(next_edge):
+                print(f"[{self.label}] ⛔ Edge {next_edge} blocked, waiting and replanning")
+                self.path = []
+                self.goal = None
+                return self.position, self.position
+
             old = self.position
             self.position = self.path[1]
             self.path = self.path[1:]
             self.steps_since_plan += 1
             return old, self.position
         else:
-            # already at goal; keep singleton so arrival check sees it
             self.path = [self.position]
             return self.position, self.position
 
@@ -141,37 +128,26 @@ class VehicleAgent(agent.Agent):
         try:
             best = min(
                 lights,
-                key=lambda l: nx.shortest_path_length(self.city.graph, self.position, l),
+                key=lambda l: nx.shortest_path_length(self.city.graph, self.position, l)
             )
             return f"light_{best[0]}_{best[1]}@localhost"
         except Exception:
             return "light1@localhost"
 
     def _peek_next_step(self):
-        """
-        Look at the next step along the current path without committing movement.
-        Returns (old_pos, next_pos). May normalize the path so that path[0] == position.
-        """
         if not self.path or self.path[0] != self.position:
-            # normalize: ensure current position is first in the path
             if self.path and self.position in self.path:
                 idx = self.path.index(self.position)
                 self.path = self.path[idx:]
             else:
-                # no valid path containing current pos
                 return self.position, self.position
 
         if len(self.path) >= 2:
             return self.position, self.path[1]
         else:
-            # already at goal; no movement
             return self.position, self.position
 
     def _light_jid_for(self, node):
-        """
-        Return the JID of the traffic light located exactly at 'node', or None if none.
-        CityEnvironment.traffic_lights is a dict: id -> (x, y), where id is 'light_x_y'.
-        """
         for lid, pos in self.city.traffic_lights.items():
             if pos == node:
                 return f"{lid}@localhost"
@@ -180,125 +156,68 @@ class VehicleAgent(agent.Agent):
     # ---------------- Behaviour ----------------
     class VehicleBehaviour(behaviour.PeriodicBehaviour):
         async def on_start(self):
-            # pausa só antes do primeiro movimento (efeito cinematográfico)
             self.first_run = True
-            
+
         async def _wait_for_green(self, from_pos, to_pos):
-            """Block until the traffic light at 'to_pos' grants passage for movement from
-            from_pos -> to_pos. If there is no traffic light at 'to_pos', returns immediately."""
-            # IMPORTANT: use self.agent here, not self
             light_jid = self.agent._light_jid_for(to_pos)
             if not light_jid:
-                # no traffic light controlling this node
                 return
 
             while True:
                 req = Message(to=light_jid)
                 req.set_metadata("type", "passage_request")
-
-                # Contract Net-style metadata: vehicle = initiator (CFP) – optional
                 req.set_metadata("protocol", "contract-net")
                 req.set_metadata("performative", "cfp")
-
                 req.body = json.dumps({"from": list(from_pos), "to": list(to_pos)})
-
-                # send/receive belong to the Behaviour (self), that's correct
                 await self.send(req)
                 incoming = await self.receive(timeout=0.8)
 
                 if not incoming:
-                    print(
-                        f"[{self.agent.label}] ⚠️ No reply from {light_jid}, retrying..."
-                    )
+                    print(f"[{self.agent.label}] ⚠️ No reply from {light_jid}, retrying...")
                     await asyncio.sleep(0.4)
                     continue
 
-                granted_flag = (
-                    incoming.metadata.get("granted", "false")
-                    if incoming.metadata
-                    else "false"
-                )
+                granted_flag = incoming.metadata.get("granted", "false") if incoming.metadata else "false"
                 granted = (granted_flag == "true")
+                performative = incoming.metadata.get("performative", "?") if incoming.metadata else "?"
 
-                # read performative from TL reply (accept-proposal / reject-proposal)
-                performative = (
-                    incoming.metadata.get("performative", "?")
-                    if incoming.metadata
-                    else "?"
-                )
-
-                print(
-                    f"[{self.agent.label}] 📩 Traffic light reply: "
-                    f"body={incoming.body}, granted={granted_flag}, perf={performative}"
-                )
-
+                print(f"[{self.agent.label}] 📩 Traffic light reply: body={incoming.body}, granted={granted_flag}, perf={performative}")
                 if granted:
-                    # accept-proposal -> green, can go
                     return
-
-                # red light / reject-proposal: wait then retry
                 await asyncio.sleep(0.5)
 
         async def run(self):
             if self.first_run:
-                await asyncio.sleep(1.5)  # small cinematic pause
+                await asyncio.sleep(1.5)
                 self.first_run = False
 
             metrics = getattr(self.agent.city, "metrics", None)
 
-            # --- Arrival handling: pause, then pick a new destination ---
-            at_goal = (
-                self.agent.goal is not None
-                and self.agent.position == self.agent.goal
-            )
-            singleton_here = (
-                len(self.agent.path) == 1
-                and self.agent.path[0] == self.agent.position
-            )
-
+            # Arrival handling
+            at_goal = self.agent.goal is not None and self.agent.position == self.agent.goal
+            singleton_here = len(self.agent.path) == 1 and self.agent.path[0] == self.agent.position
             if at_goal or singleton_here:
-                print(
-                    f"[{self.agent.label}] ✅ Reached {self.agent.goal}, "
-                    f"pausing 3s then choosing a new destination…"
-                )
-
-                # Fim de viagem para efeitos de métricas
+                print(f"[{self.agent.label}] ✅ Reached {self.agent.goal}, pausing 3s...")
                 if metrics is not None and self.agent.goal is not None:
                     metrics.end_trip(self.agent.label)
-
                 await asyncio.sleep(3)
-                # reset so next tick will plan a fresh trip
                 self.agent.goal = None
                 self.agent.path = []
                 self.agent.steps_since_plan = 0
                 return
-            # ------------------------------------------------------------
 
-            # 1) Plan if no path / no goal / periodic replan
-            need_plan = (
-                (not self.agent.path)
-                or (self.agent.goal is None)
-                or (self.agent.steps_since_plan >= self.agent.replan_every)
-            )
+            # Plan if needed
+            need_plan = (not self.agent.path) or (self.agent.goal is None) or (self.agent.steps_since_plan >= self.agent.replan_every)
 
-            # 2) Incident-aware replan trigger (safe; won't block movement)
+            # Incident-aware replan
             incident_near = False
             try:
                 incident_msg = None
                 if USE_FILTERED_INCIDENTS and Template is not None:
-                    # Only consume messages explicitly tagged as incidents
-                    incident_msg = await self.receive(
-                        timeout=0.01,
-                        filter=Template(metadata={"type": "incident"})
-                    )
+                    incident_msg = await self.receive(timeout=0.01, filter=Template(metadata={"type": "incident"}))
                 else:
-                    # Lightweight peek: only act if body clearly indicates an incident
                     candidate = await self.receive(timeout=0.01)
-                    if (
-                        candidate
-                        and isinstance(candidate.body, str)
-                        and "Accident reported near" in candidate.body
-                    ):
+                    if candidate and isinstance(candidate.body, str) and "Accident reported near" in candidate.body:
                         incident_msg = candidate
 
                 if incident_msg and isinstance(incident_msg.body, str):
@@ -307,105 +226,66 @@ class VehicleAgent(agent.Agent):
                         p = (int(m.group(1)), int(m.group(2)))
                         if manhattan(p, self.agent.position) <= 4:
                             incident_near = True
-                            print(
-                                f"[{self.agent.label}] 🔁 Rerouting due to "
-                                f"nearby incident at {p}"
-                            )
+                            print(f"[{self.agent.label}] 🔁 Rerouting due to incident at {p}")
             except Exception as e:
-                # Never let incident parsing stop movement
                 print("[INCIDENT CHECK WARN]", e)
 
-            if need_plan or (
-                incident_near
-                and (self.agent.goal is not None)
-                and (self.agent.position != self.agent.goal)
-            ):
-                # Se não houver destino, vamos iniciar uma NOVA viagem
+            if need_plan or (incident_near and self.agent.goal is not None and self.agent.position != self.agent.goal):
                 if self.agent.goal is None:
                     self.agent.goal = self.agent._choose_far_goal()
-                    # Início de viagem para efeitos de métricas
                     if metrics is not None:
                         metrics.start_trip(self.agent.label)
-
                 self.agent._plan_to(self.agent.goal)
 
-            # 3) Move: prefer path step (with traffic light coordination),
-            #    fallback to random if no path
+            # Move along path
             if self.agent.path:
                 old_pos, candidate_new = self.agent._peek_next_step()
                 if old_pos != candidate_new:
-                    # Ask the traffic light (if any) controlling the target intersection
                     await self._wait_for_green(old_pos, candidate_new)
 
-                    # --- COLLISION AVOIDANCE: don't step into an occupied node ---
                     all_vehicles = self.agent.shared.get("vehicles", {})
                     all_emergency = self.agent.shared.get("emergency", {})
                     others = {**all_vehicles, **all_emergency}
-
-                    occupied = any(
-                        pos == candidate_new and name != self.agent.label
-                        for name, pos in others.items()
-                    )
+                    occupied = any(pos == candidate_new and name != self.agent.label for name, pos in others.items())
 
                     if occupied:
-                        # Someone is already there → stay in place this tick AND drop current plan
-                        print(
-                            f"[{self.agent.label}] ⛔ target {candidate_new} occupied, "
-                            f"staying at {old_pos} and replanning next tick"
-                        )
+                        print(f"[{self.agent.label}] ⛔ target {candidate_new} occupied, staying at {old_pos}")
                         new_pos = old_pos
-
-                        # force replan / new decision on next tick
                         self.agent.path = []
                         self.agent.goal = None
                         self.agent.steps_since_plan = 0
                     else:
-                        # Commit movement along the path
                         self.agent.position = candidate_new
-                        # Drop nodes up to the new position so path[0] == position
                         if self.agent.position in self.agent.path:
                             idx = self.agent.path.index(self.agent.position)
                             self.agent.path = self.agent.path[idx:]
                         else:
                             self.agent.path = [self.agent.position]
                         self.agent.steps_since_plan += 1
-
                         new_pos = self.agent.position
                 else:
-                    # Path does not give a new move; fallback to random move
                     old_pos, new_pos = self.agent._move_randomly()
             else:
                 old_pos, new_pos = self.agent._move_randomly()
 
-
-            # 4) Occupancy + congestion snapshot (safe if not wired)
+            # Occupancy update
             try:
-                # update edge occupancy when the vehicle actually moves
                 if old_pos != new_pos:
                     self.agent.city.occupancy.leave(old_pos, new_pos, self.agent.label)
                     self.agent.city.occupancy.enter(old_pos, new_pos, self.agent.label)
-
-                # log congestion snapshot by updating edge weights
-                # (this will call city.metrics.log_congestion(...) if metrics is set)
                 if hasattr(self.agent.city, "update_edge_weights"):
                     self.agent.city.update_edge_weights()
             except Exception as e:
                 print("[OCCUPANCY/WEIGHTS ERROR]", e)
 
-            # 5) Viewer update
+            # Viewer update
             try:
-                self.agent.shared.setdefault("vehicles", {})[
-                    self.agent.label
-                ] = self.agent.position
+                self.agent.shared.setdefault("vehicles", {})[self.agent.label] = self.agent.position
             except Exception as e:
                 print("[VIS-WRITE vehicle tick ERROR]", e)
 
-            print(
-                f"[{self.agent.label}] 🚗 moved {old_pos} → {new_pos} "
-                f"(goal={self.agent.goal})"
-            )
+            print(f"[{self.agent.label}] 🚗 moved {old_pos} → {new_pos} (goal={self.agent.goal})")
 
     async def setup(self):
         print(f"[{self.label}] Vehicle agent initialized at {self.position}")
-        # 1 passo por segundo
-        self.add_behaviour(self.VehicleBehaviour(period=1.0))
+        self.add_behaviour(self.VehicleBehaviour(period=1.5))
