@@ -1,4 +1,21 @@
-# main.py
+"""
+Main entry point for the Smart Traffic Management simulation.
+
+This module initializes the city environment, spawns all autonomous agents
+(vehicles, ambulances, traffic lights, and the incident reporter), launches
+the live visualizer, and starts the simulation event loop.
+
+The simulation runs asynchronously using SPADE agents and monitors:
+    - normal vehicle movement
+    - emergency vehicle response
+    - traffic light coordination using Contract-Net
+    - dynamic roadblock generation and event propagation
+    - congestion monitoring
+    - metric collection and plot generation
+
+The program terminates only when manually stopped.
+"""
+
 import asyncio
 from agents.vehicle import VehicleAgent
 from agents.traffic_lights import TrafficLightAgent
@@ -10,12 +27,30 @@ from utils.metrics import Metrics
 
 
 async def main():
+    """
+    Launches and manages the full simulation lifecycle.
+
+    Responsibilities:
+        - Initialize Metrics, CityEnvironment, and shared state
+        - Create and start SPADE agents (vehicles, emergency vehicles,
+          traffic lights, incident reporter)
+        - Launch the visualizer update loop
+        - Start a background process that injects random roadblocks
+        - Continuously log global congestion (rho)
+        - Save metrics and plots when the simulation ends
+
+    This function blocks indefinitely in the main loop until the program
+    is terminated externally.
+
+    Raises:
+        asyncio.CancelledError: If the main loop is cancelled by shutdown.
+    """
     # ---------------------------------------------------
     # INIT METRICS + CITY + SHARED STATE + VISUALIZER
     # ---------------------------------------------------
     metrics = Metrics(filename="metrics.csv")
     city = CityEnvironment()
-    city.metrics = metrics
+    city.metrics = metrics  # link city to metrics collector
 
     shared = {
         "vehicles": {},
@@ -24,6 +59,7 @@ async def main():
         "metrics": metrics,
     }
 
+    # Launch the visualizer asynchronously
     vis = Visualizer(city, shared, refresh_hz=4)
     asyncio.create_task(vis.update_loop())
 
@@ -31,9 +67,9 @@ async def main():
     # BUILD ALL AGENT INSTANCES (no starts yet)
     # ---------------------------------------------------
 
-    # Vehicles
+    # Vehicles (10 normal agents)
     vehicles = []
-    for i in range(1, 11):   # vehicle1 .. vehicle10
+    for i in range(1, 11):
         jid = f"vehicle{i}@localhost"
         v = VehicleAgent(
             jid,
@@ -45,9 +81,9 @@ async def main():
         vehicles.append(v)
         city.vehicle_jids.append(jid)
 
-    # Emergency vehicles
+    # Emergency vehicles (5 ambulances)
     ambulances = []
-    for i in range(1, 6):  # emergency1 .. emergency5
+    for i in range(1, 6):
         jid = f"emergency{i}@localhost"
         em = EmergencyVehicleAgent(
             jid,
@@ -67,7 +103,7 @@ async def main():
         tl = TrafficLightAgent(jid, "password", city_env=city, shared=shared)
         light_agents.append(tl)
 
-    # Incident reporter
+    # Incident reporter (injects accident events & gossips them)
     reporter = IncidentReporterAgent(
         "reporter@localhost",
         "password",
@@ -78,11 +114,12 @@ async def main():
     # ---------------------------------------------------
     # START *EVERYTHING* CONCURRENTLY
     # ---------------------------------------------------
-    start_coros = []
-    start_coros += [v.start(auto_register=True) for v in vehicles]
-    start_coros += [em.start(auto_register=True) for em in ambulances]
-    start_coros += [tl.start(auto_register=True) for tl in light_agents]
-    start_coros.append(reporter.start(auto_register=True))
+    start_coros = (
+        [v.start(auto_register=True) for v in vehicles] +
+        [em.start(auto_register=True) for em in ambulances] +
+        [tl.start(auto_register=True) for tl in light_agents] +
+        [reporter.start(auto_register=True)]
+    )
 
     await asyncio.gather(*start_coros)
 
@@ -92,11 +129,20 @@ async def main():
     print("🚦 Simulation + Viewer started with Incident Reporter.")
 
     # ---------------------------------------------------
-    # START RANDOM ROADBLOCK LOOP (AFTER AGENTS ARE LIVE)
+    # START RANDOM ROADBLOCK LOOP
     # ---------------------------------------------------
     async def delayed_roadblocks():
-        # small delay so you see "clean" traffic first; tweak if you want
-        await city.random_roadblocks_loop(interval=3.0, ttl=8.0, max_blocks=3)
+        """
+        Continuously spawns temporary roadblocks at random locations.
+
+        This runs as a background coroutine and injects incidents every few
+        seconds, allowing agents to react and replan in real time.
+        """
+        await city.random_roadblocks_loop(
+            interval=3.0,
+            ttl=8.0,
+            max_blocks=3
+        )
 
     asyncio.create_task(delayed_roadblocks())
 
@@ -106,27 +152,46 @@ async def main():
     try:
         while True:
             await asyncio.sleep(1)
+
+            # --- log congestion (rho) ---
+            try:
+                all_pos = (
+                    list(shared.get("vehicles", {}).values()) +
+                    list(shared.get("emergency", {}).values())
+                )
+                unique_occ = len({tuple(p) for p in all_pos})
+                total_nodes = city.graph.number_of_nodes()
+
+                rho = unique_occ / total_nodes if total_nodes > 0 else 0.0
+                metrics.log_congestion(rho)
+
+            except Exception as e:
+                print("[MAIN] Congestion logging error:", e)
+
     except asyncio.CancelledError:
+        # Graceful shutdown
         pass
+
     finally:
-        # Save metrics
+        # ---------------------------------------------------
+        # SAVE METRICS + PLOTS
+        # ---------------------------------------------------
         try:
-            summary = metrics.summary()
-            print("[MAIN] Metrics summary:", summary)
+            print("[MAIN] Metrics summary:", metrics.summary())
         except Exception as e:
-            print(f"[MAIN] Error computing metrics summary: {e}")
+            print("[MAIN] Error computing metrics summary:", e)
 
         try:
             metrics.save()
-            print("[MAIN] Metrics saved to", metrics.filename)
+            print("[MAIN] Metrics saved.")
         except Exception as e:
-            print(f"[MAIN] Error saving metrics: {e}")
+            print("[MAIN] Error saving metrics:", e)
 
         try:
             metrics.save_plots()
-            print("[MAIN] Metric plots saved as PNG files.")
+            print("[MAIN] Metric plots saved.")
         except Exception as e:
-            print(f"[MAIN] Error saving metric plots: {e}")
+            print("[MAIN] Error saving plots:", e)
 
 
 if __name__ == "__main__":

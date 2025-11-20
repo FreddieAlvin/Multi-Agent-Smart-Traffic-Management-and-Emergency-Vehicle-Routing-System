@@ -1,25 +1,57 @@
+"""
+traffic_lights.py
+
+Implements the TrafficLightAgent, a SPADE agent that simulates an adaptive
+traffic light in a grid-based smart-city environment.
+
+Each traffic light:
+  - Alternates between two phases:
+        Phase 0: North/South movement allowed
+        Phase 1: East/West movement allowed
+  - Adapts its phase duration based on local road congestion
+  - Responds to two types of requests:
+        - priority_request (emergency vehicles)
+        - passage_request (regular vehicles)
+  - Integrates with the EventManager to block edges affected by incidents
+  - Follows a Contract Net–style reply semantics (accept/reject proposals)
+
+This file defines:
+    direction() → Infer direction of movement from grid coordinates.
+    TrafficLightAgent → SPADE agent controlling a single traffic light.
+"""
+
 import asyncio
 import json
 from spade import agent, behaviour
 from spade.message import Message
 
-# Fase 0: Norte/Sul
-# Fase 1: Este/Oeste
+# Phase definitions
 ALLOWED_BY_PHASE = {
-    0: {"N", "S"},
-    1: {"E", "W"},
+    0: {"N", "S"},   # Phase 0
+    1: {"E", "W"},   # Phase 1
 }
 
-# valor base; será adaptado dinamicamente consoante a densidade
-PHASE_DURATION = 5.0  # segundos
+PHASE_DURATION = 5.0   # Default base duration in seconds
 
 
 def direction(from_pos, to_pos):
-    """Devolve 'N','S','E','W' consoante o movimento."""
+    """
+    Infer movement direction between two grid coordinates.
+
+    Args:
+        from_pos (tuple[int, int]): Current position (x, y).
+        to_pos (tuple[int, int]): Next position (x, y).
+
+    Returns:
+        str | None:
+            "N", "S", "E", or "W" depending on movement.
+            None if movement is diagonal or zero.
+    """
     (x1, y1) = from_pos
     (x2, y2) = to_pos
     dx = x2 - x1
     dy = y2 - y1
+
     if dx == 1 and dy == 0:
         return "E"
     if dx == -1 and dy == 0:
@@ -28,23 +60,50 @@ def direction(from_pos, to_pos):
         return "N"
     if dx == 0 and dy == -1:
         return "S"
-    # movimento estranho (diagonal ou stay); por segurança, não deixar passar
+
     return None
 
 
+
 class TrafficLightAgent(agent.Agent):
+    """
+    Traffic light controller agent.
+
+    This agent autonomously alternates between NS and EW phases, adjusts the
+    duration of each phase according to observed traffic density, and processes
+    vehicle passage requests.
+
+    Attributes:
+        city (CityEnvironment): The global environment object.
+        shared (dict): Shared state dictionary for visualization.
+        position (tuple[int, int] | None): Grid coordinate of the light.
+        phase (int): Current phase (0=NS, 1=EW).
+        phase_duration (float): Adaptive duration of the current phase.
+        _last_switch (float): Time of last phase toggle.
+    """
+
     def __init__(self, jid, password, city_env=None, shared=None):
         super().__init__(jid, password)
         self.city = city_env
         self.shared = shared or {}
-        self.position = None          # (x, y) deste semáforo na grelha
+        self.position = None
         self.phase_duration = PHASE_DURATION
         self.phase = 0
         self._last_switch = 0.0
 
     class LightBehaviour(behaviour.CyclicBehaviour):
+        """
+        Cyclic behaviour controlling the traffic-light loop.
+
+        Responsibilities:
+            1. Adapt phase duration using local traffic density.
+            2. Toggle phase when time expires.
+            3. Process passage requests (regular or emergency).
+            4. Use Contract Net semantics for responses.
+        """
+
         async def on_start(self):
-            # estado inicial do semáforo
+            """Initializes light phase and timestamp."""
             self.agent.phase = 0
             self.agent._last_switch = asyncio.get_event_loop().time()
             print(
@@ -53,26 +112,28 @@ class TrafficLightAgent(agent.Agent):
             )
 
         async def run(self):
+            """Main control loop executed repeatedly."""
             now = asyncio.get_event_loop().time()
 
-            # 0) adaptar duração da fase com base na densidade local (se tivermos city)
-            if getattr(self.agent, "city", None) is not None and self.agent.position is not None:
+            # -------------------------------------------------------
+            # 1) Adapt duration using local traffic density
+            # -------------------------------------------------------
+            if getattr(self.agent, "city", None) and self.agent.position:
                 try:
-                    # densidade média numa vizinhança à volta da interseção
                     rho = self.agent.city.occupancy.local_density(
                         self.agent.position,
                         radius=2,
                     )
-                    # mapear rho ∈ [0,1+] para duração ∈ [3, 8] segundos
                     self.agent.phase_duration = max(
-                        3.0,
-                        min(8.0, 3.0 + 5.0 * float(rho)),
+                        3.0, min(8.0, 3.0 + 5.0 * float(rho))
                     )
                 except Exception as e:
                     print(f"[Traffic Light {self.agent.jid}] ⚠️ density adapt error: {e}")
                     self.agent.phase_duration = PHASE_DURATION
 
-            # 1) alternar de fase periodicamente
+            # -------------------------------------------------------
+            # 2) Toggle phase if duration expired
+            # -------------------------------------------------------
             if now - self.agent._last_switch >= self.agent.phase_duration:
                 self.agent.phase = 1 - self.agent.phase
                 self.agent._last_switch = now
@@ -82,20 +143,21 @@ class TrafficLightAgent(agent.Agent):
                     f"duration={self.agent.phase_duration:.1f}s)"
                 )
 
-            # 2) tratar pedidos de passagem
+            # -------------------------------------------------------
+            # 3) Handle incoming passage requests
+            # -------------------------------------------------------
             msg = await self.receive(timeout=0.1)
             if not msg:
                 return
 
             mtype = msg.metadata.get("type") if msg.metadata else None
 
-            # Esperamos que o body venha em JSON com { "from": [x,y], "to": [x,y] }
+            # Parse body safely
             try:
                 payload = json.loads(msg.body)
                 from_pos = tuple(payload["from"])
                 to_pos = tuple(payload["to"])
             except Exception:
-                # se o formato vier diferente, loga e nega (para não rebentar)
                 print(
                     f"[Traffic Light {self.agent.jid}] ⚠️ Invalid message body: "
                     f"{msg.body}"
@@ -103,7 +165,7 @@ class TrafficLightAgent(agent.Agent):
                 await self._reply(msg, granted=False, reason="invalid_body")
                 return
 
-            # Emergência: pode sempre passar
+            # Emergency: always granted
             if mtype == "priority_request":
                 print(
                     f"[Traffic Light {self.agent.jid}] 🚑 Priority request "
@@ -112,7 +174,7 @@ class TrafficLightAgent(agent.Agent):
                 await self._reply(msg, granted=True, reason="emergency")
                 return
 
-            # Veículo normal: verificar direção vs fase atual
+            # Non-emergency vehicle
             d = direction(from_pos, to_pos)
             if d is None:
                 print(
@@ -126,7 +188,7 @@ class TrafficLightAgent(agent.Agent):
             granted = d in allowed_dirs
             reason = "phase_check"
 
-            # NOVO: verifica se a estrada está bloqueada
+            # Incident check (blocked edge)
             if getattr(self.agent.city, "event_manager", None):
                 edge = (from_pos, to_pos)
                 if self.agent.city.event_manager.is_blocked(edge):
@@ -145,19 +207,22 @@ class TrafficLightAgent(agent.Agent):
             await self._reply(msg, granted=granted, reason=reason)
 
         async def _reply(self, msg, granted: bool, reason: str = ""):
-            """Responder ao veículo / ambulância com semântica tipo Contract Net."""
+            """
+            Send a Contract Net–style reply to a vehicle or ambulance.
+
+            Args:
+                msg (Message): Incoming request message.
+                granted (bool): Whether passage is allowed.
+                reason (str): Explanation for logging.
+            """
             reply = Message(to=str(msg.sender))
             reply.set_metadata("type", "passage_reply")
-
-            # Contract Net-style metadata
             reply.set_metadata("protocol", "contract-net")
 
             mtype = msg.metadata.get("type") if msg.metadata else None
             if mtype == "priority_request":
-                # emergência: é sempre "accept-proposal"
                 reply.set_metadata("performative", "accept-proposal")
             else:
-                # veículo normal: aceita se granted, caso contrário rejeita
                 reply.set_metadata(
                     "performative",
                     "accept-proposal" if granted else "reject-proposal",
@@ -166,19 +231,23 @@ class TrafficLightAgent(agent.Agent):
             reply.set_metadata("granted", "true" if granted else "false")
             if reason:
                 reply.set_metadata("reason", reason)
+
             reply.body = "granted" if granted else "denied"
             await self.send(reply)
-            await asyncio.sleep(1.5)  # slows the loop
-
+            await asyncio.sleep(1.5)
 
     async def setup(self):
+        """
+        Initializes the traffic-light agent.
+
+        Extracts its grid position from its JID (e.g., 'light_4_8@localhost'),
+        sets initial timing parameters, and registers the behaviour loop.
+        """
         print(f"Traffic Light Agent {self.jid} ready")
 
-        # descobrir a posição deste semáforo a partir do id (ex: 'light_4_8')
-        if self.city is not None:
-            lid = str(self.jid).split("@")[0]   # "light_4_8"
+        if self.city:
+            lid = str(self.jid).split("@")[0]
             self.position = self.city.traffic_lights.get(lid)
 
-        # fase inicial
         self.phase_duration = PHASE_DURATION
         self.add_behaviour(self.LightBehaviour())

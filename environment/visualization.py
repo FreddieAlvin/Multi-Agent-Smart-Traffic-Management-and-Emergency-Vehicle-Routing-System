@@ -1,4 +1,19 @@
-# environment/visualizer.py
+"""
+Visualization module for the Smart Traffic Simulation.
+
+This component is responsible for live rendering of the simulation using
+Matplotlib. It displays:
+  • road network grid
+  • vehicles
+  • emergency vehicles
+  • traffic lights
+  • hospitals
+  • incidents (blocked edges)
+
+The visualizer runs asynchronously, refreshing at a configurable frequency,
+pulling data from the shared state dictionary updated by all SPADE agents.
+"""
+
 import time
 import numpy as np
 import matplotlib.pyplot as plt
@@ -11,28 +26,78 @@ from matplotlib.legend_handler import HandlerBase
 
 
 class HandlerImage(HandlerBase):
-    """Custom legend handler to display an image."""
+    """
+    Custom legend handler that displays an image instead of a text marker.
+
+    Attributes:
+        img (ndarray): Loaded image to display.
+        zoom (float): Scale factor applied when embedding the image.
+    """
+
     def __init__(self, img, zoom=0.03):
         self.img = img
         self.zoom = zoom
         super().__init__()
 
-    def create_artists(self, legend, orig_handle,
-                       xdescent, ydescent, width, height, fontsize, trans):
+    def create_artists(
+        self,
+        legend,
+        orig_handle,
+        xdescent,
+        ydescent,
+        width,
+        height,
+        fontsize,
+        trans,
+    ):
+        """
+        Creates the artist elements used inside the legend.
+
+        Returns:
+            list: A list containing one AnnotationBbox with the scaled image.
+        """
         im = OffsetImage(self.img, zoom=self.zoom)
-        ab = AnnotationBbox(im, [width / 2, height / 2], frameon=False, xycoords=trans)
+        ab = AnnotationBbox(
+            im, [width / 2, height / 2], frameon=False, xycoords=trans
+        )
         return [ab]
 
 
 class Visualizer:
+    """
+    Live visualization engine that renders the simulation environment.
+
+    The Visualizer:
+      • loads sprites from /environment/assets/
+      • draws the static grid once
+      • periodically refreshes positions of vehicles, ambulances, lights
+      • renders incidents as edge markers
+      • runs as an async loop in parallel with SPADE agents
+
+    Attributes:
+        city (CityEnvironment): The environment containing graph and assets.
+        shared (dict): Shared dictionary updated by agents with their positions.
+        refresh (int): Refresh rate (Hz).
+        period (float): Time per frame (s).
+        fig, ax: Matplotlib figure and axes used for rendering.
+    """
+
     def __init__(self, city, shared_state, refresh_hz=5):
+        """
+        Initialize the visualization engine.
+
+        Args:
+            city (CityEnvironment): The grid and objects to draw.
+            shared_state (dict): Real-time positions (vehicles, emergency, lights).
+            refresh_hz (int): How many times per second to refresh.
+        """
         self.city = city
         self.shared = shared_state
         self.refresh = max(1, refresh_hz)
         self.period = 1.0 / self.refresh
         self._last_log = 0.0
 
-        # Load images from environment/assets
+        # Load sprite assets
         base_path = os.path.join("environment", "assets")
         self.car_img = mpimg.imread(os.path.join(base_path, "car.png"))
         self.ev_img = mpimg.imread(os.path.join(base_path, "ambulance.png"))
@@ -40,17 +105,16 @@ class Visualizer:
         self.light_img = mpimg.imread(os.path.join(base_path, "traffic_light.png"))
         self.roadblock_img = mpimg.imread(os.path.join(base_path, "roadblock.png"))
 
-        # Figure and axes
+        # Static plot: background + grid
         self.fig, self.ax = plt.subplots(figsize=(7, 7))
-        self.ax.set_facecolor("#8dc68d")  # light green background
+        self.ax.set_facecolor("#8dc68d")
 
         pos = {n: n for n in self.city.graph.nodes}
         nx.draw_networkx_edges(self.city.graph, pos, width=0.2, ax=self.ax)
 
-        # Legend using images
+        # Legend with images
         handles = ["Traffic Light", "Vehicles", "Emergency", "Hospital", "Incident"]
         labels = ["Traffic Light", "Vehicles", "Emergency", "Hospital", "Incident"]
-
         handler_map = {
             "Traffic Light": HandlerImage(self.light_img, zoom=0.01),
             "Vehicles": HandlerImage(self.car_img, zoom=0.03),
@@ -59,7 +123,7 @@ class Visualizer:
             "Incident": HandlerImage(self.roadblock_img, zoom=0.03),
         }
 
-        leg = self.ax.legend(
+        legend = self.ax.legend(
             handles=handles,
             labels=labels,
             handler_map=handler_map,
@@ -68,11 +132,8 @@ class Visualizer:
             borderaxespad=0.0,
             frameon=True,
         )
-
-        # optional: tint legend background to match the figure a bit
-        leg.get_frame().set_facecolor("#d3d3d3")
-        leg.get_frame().set_edgecolor("none")
-
+        legend.get_frame().set_facecolor("#d3d3d3")
+        legend.get_frame().set_edgecolor("none")
 
         self.ax.set_title("Smart Traffic — Live")
         self.ax.set_xlim(-1, self.city.width)
@@ -80,11 +141,19 @@ class Visualizer:
         self.ax.set_aspect("equal", adjustable="box")
         plt.tight_layout()
 
-        # Containers for drawn elements
+        # Runtime artists
         self._img_artists = []
         self._roadblock_artists = []
 
     async def update_loop(self):
+        """
+        Asynchronous refresh loop that updates the visual state continuously.
+
+        This method:
+            • calls `_update()` once per refresh period
+            • redraws only dynamic elements
+            • keeps the Matplotlib window alive without blocking SPADE
+        """
         plt.show(block=False)
         while True:
             await asyncio.sleep(self.period)
@@ -93,76 +162,90 @@ class Visualizer:
             self.fig.canvas.flush_events()
 
     def _update(self):
-        # --- VEHICLES ---
+        """
+        Redraw all dynamic elements (vehicles, ambulances, incidents, lights).
+
+        This method fetches the latest shared state values updated by all agents,
+        removes previous frame artifacts, and redraws icons at updated positions.
+        """
+        # Read state -----------------------
         vpos = list(self.shared.get("vehicles", {}).values())
         v_arr = np.array(vpos, float).reshape(-1, 2) if vpos else np.empty((0, 2))
 
-        # --- EMERGENCY VEHICLES ---
         epos = list(self.shared.get("emergency", {}).values())
         e_arr = np.array(epos, float).reshape(-1, 2) if epos else np.empty((0, 2))
 
-        # --- HOSPITALS ---
-        hpos = list(self.city.hospitals.values()) if hasattr(self.city, "hospitals") else []
-
-        # --- TRAFFIC LIGHTS ---
+        hpos = list(self.city.hospitals.values())
         lpos = list(self.shared.get("lights", []))
 
-        # --- ROADBLOCKS / INCIDENTS ---
-        rnodes = list(self.city.event_manager.blocked_nodes()) if hasattr(self.city, "event_manager") else []
-        redges = list(self.city.event_manager.blocked_edges()) if hasattr(self.city, "event_manager") else []
+        rnodes = self.city.event_manager.blocked_nodes()
+        redges = self.city.event_manager.blocked_edges()
 
-        # Clear previous artists
+        # Clear previous frame ------------
         for art in self._img_artists:
             art.remove()
         for art in self._roadblock_artists:
             art.remove()
-
         self._img_artists.clear()
         self._roadblock_artists.clear()
 
-        # Draw hospitals
+        # Hospitals
         for x, y in hpos:
-            im = OffsetImage(self.hospital_img, zoom=0.02)
-            ab = AnnotationBbox(im, (x, y), frameon=False, zorder=10)
+            icon = OffsetImage(self.hospital_img, zoom=0.02)
+            ab = AnnotationBbox(icon, (x, y), frameon=False, zorder=10)
             self.ax.add_artist(ab)
             self._img_artists.append(ab)
 
-        # Draw traffic lights
+        # Traffic lights
         for x, y in lpos:
-            im = OffsetImage(self.light_img, zoom=0.01)
-            ab = AnnotationBbox(im, (x, y), frameon=False, zorder=10)
+            icon = OffsetImage(self.light_img, zoom=0.01)
+            ab = AnnotationBbox(icon, (x, y), frameon=False, zorder=10)
             self.ax.add_artist(ab)
             self._img_artists.append(ab)
 
-        # Draw vehicles
+        # Vehicles
         for x, y in v_arr:
-            im = OffsetImage(self.car_img, zoom=0.03)
-            ab = AnnotationBbox(im, (x, y), frameon=False, zorder=12)
+            icon = OffsetImage(self.car_img, zoom=0.03)
+            ab = AnnotationBbox(icon, (x, y), frameon=False, zorder=12)
             self.ax.add_artist(ab)
             self._img_artists.append(ab)
 
-        # Draw emergency vehicles
+        # Emergency vehicles
         for x, y in e_arr:
-            im = OffsetImage(self.ev_img, zoom=0.03)
-            ab = AnnotationBbox(im, (x, y), frameon=False, zorder=13)
+            icon = OffsetImage(self.ev_img, zoom=0.03)
+            ab = AnnotationBbox(icon, (x, y), frameon=False, zorder=13)
             self.ax.add_artist(ab)
             self._img_artists.append(ab)
 
-        # 🔴 Draw blocked edges + icon in the middle (instead of on nodes)
+        # Incidents (edges + icon)
         for (u, v) in redges:
-            # red line along the edge
-            x_vals = [u[0], v[0]]
-            y_vals = [u[1], v[1]]
-            art = self.ax.plot(x_vals, y_vals, color="red", linewidth=2,
-                               zorder=11, alpha=0.6)[0]
+            # red line marking blocked edge
+            art = self.ax.plot(
+                [u[0], v[0]],
+                [u[1], v[1]],
+                color="red",
+                linewidth=2,
+                zorder=11,
+                alpha=0.6,
+            )[0]
             self._roadblock_artists.append(art)
 
-            # icon at the midpoint of the edge
-            mx = (u[0] + v[0]) / 2.0
-            my = (u[1] + v[1]) / 2.0
-            im = OffsetImage(self.roadblock_img, zoom=0.025)
-            ab = AnnotationBbox(im, (mx, my), frameon=False, zorder=12)
+            # icon at midpoint
+            mx = (u[0] + v[0]) / 2
+            my = (u[1] + v[1]) / 2
+            icon = OffsetImage(self.roadblock_img, zoom=0.025)
+            ab = AnnotationBbox(icon, (mx, my), frameon=False, zorder=12)
             self.ax.add_artist(ab)
             self._img_artists.append(ab)
 
-        # (no more "Draw blocked nodes" loop here)
+        # Log heartbeat
+        now = time.time()
+        if now - self._last_log > 0.5:
+            print(
+                f"[VIS] vehicles={len(v_arr)} "
+                f"emergency={len(e_arr)} "
+                f"hospitals={len(hpos)} "
+                f"traffic_lights={len(lpos)} "
+                f"blocked_edges={len(redges)}"
+            )
+            self._last_log = now

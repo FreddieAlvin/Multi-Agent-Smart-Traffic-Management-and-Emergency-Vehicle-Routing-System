@@ -1,125 +1,226 @@
-# environment/city.py
-import networkx as nx
-import random
+"""
+city.py
+
+Definition of the grid-based city environment used by all agents.
+
+The CityEnvironment class:
+  * creates a rectangular grid as a NetworkX graph;
+  * attaches edge weights that can change with congestion;
+  * keeps track of traffic lights and hospitals;
+  * exposes helper methods to:
+      - sample free nodes;
+      - compute average congestion;
+      - randomly spawn and remove temporary roadblocks.
+"""
+
 import asyncio
-from environment.events import EventManager          # incident/roadblock management
-from environment.occupancy import Occupancy          # traffic density tracking
+import random
+from typing import Dict, Tuple, List
+
+import networkx as nx
+
+from .occupancy import Occupancy
+from .events import EventManager
 
 
 class CityEnvironment:
-    def __init__(self, width=20, height=20, congestion_weight=2.0):
+    """
+    Grid city with dynamic edge weights, occupancy, and incidents.
+
+    Attributes:
+        width:   Number of columns in the grid.
+        height:  Number of rows in the grid.
+        graph:   NetworkX graph representing the road network.
+        traffic_lights:
+            Map from light id (e.g. "light_4_4") to node coordinates.
+        hospitals:
+            Map from hospital id to node coordinates.
+        occupancy:
+            Occupancy helper that tracks how many vehicles use each edge.
+        event_manager:
+            EventManager that stores temporary incidents / roadblocks.
+        metrics:
+            Optional Metrics object, filled by main.py.
+        vehicle_jids:
+            List of JIDs for all vehicle agents (for broadcast if needed).
+    """
+
+    def __init__(self, width: int = 20, height: int = 20) -> None:
+        """
+        Build a new grid city.
+
+        Args:
+            width:  Grid width in cells.
+            height: Grid height in cells.
+        """
         self.width = width
         self.height = height
-        self.graph = nx.grid_2d_graph(width, height)
 
-        # Agents / infrastructure
-        self.traffic_lights = self._generate_traffic_lights()
-        self.buildings = self._generate_buildings()
-        self.hospitals = self._generate_hospitals()
-        self.vehicle_jids = []  # list of vehicle agent JIDs for incident broadcasting
+        # Underlying road network
+        self.graph: nx.Graph = nx.grid_2d_graph(width, height)
 
-        # Systems
-        self.event_manager = EventManager()
+        # Basic static attributes
+        self.traffic_lights: Dict[str, Tuple[int, int]] = {}
+        self.hospitals: Dict[str, Tuple[int, int]] = {}
+        self.vehicle_jids: List[str] = []
+
+        # Dynamic components
         self.occupancy = Occupancy(self.graph)
-        self.congestion_weight = congestion_weight
+        self.event_manager = EventManager()
 
-        # Graph initialization
-        self._initialize_edge_weights()
-        self._annotate_graph()
+        # Optional metrics object set from outside
+        self.metrics = None
 
-    # -------------------------
-    # Edge weights / congestion
-    # -------------------------
-    def _initialize_edge_weights(self):
-        for u, v in self.graph.edges:
-            self.graph[u][v]['weight'] = 1.0
+        # Initialize structure of the city
+        self._build_grid()
+        self._add_traffic_lights()
+        self._add_hospitals()
 
-    def update_edge_weights(self):
-        """Recalculate edge weights dynamically based on incidents and congestion."""
-        self.event_manager.clear_expired()
-        for u, v in self.graph.edges:
-            base = 1.0
-            incident_penalty = self.event_manager.penalty((u, v))
-            density = self.occupancy.rho((u, v))  # current traffic density
-            self.graph[u][v]['weight'] = base + incident_penalty + self.congestion_weight * density
+    # ------------------------------------------------------------------
+    # Grid construction helpers
+    # ------------------------------------------------------------------
 
-    # -------------------------
-    # Infrastructure generators
-    # -------------------------
-    def _generate_traffic_lights(self):
-        # Traffic lights every 4x4 grid block
-        return {f"light_{x}_{y}": (x, y)
-                for x in range(0, self.width, 4)
-                for y in range(0, self.height, 4)}
+    def _build_grid(self) -> None:
+        """
+        Attach default weights to each edge of the grid.
 
-    def _generate_buildings(self):
-        # Buildings avoid traffic light intersections
-        return {f"building_{x}_{y}": (x + 0.5, y + 0.5)
-                for x in range(self.width - 1)
-                for y in range(self.height - 1)
-                if (x % 4 != 0 or y % 4 != 0)}
+        Currently every edge starts with weight = 1.0. This value
+        is later adjusted to reflect congestion (via Occupancy).
+        """
+        for u, v in self.graph.edges():
+            # All roads start with the same base cost.
+            self.graph[u][v]["weight"] = 1.0
 
-    def _generate_hospitals(self):
-        return {
-            "hospital_north": (2, self.height - 2),
-            "hospital_south": (self.width - 3, 2),
-            "hospital_central": (self.width // 2, self.height // 2)
+    def _add_traffic_lights(self) -> None:
+        """
+        Place traffic lights at some intersections.
+
+        For simplicity, this places one light at each 4x4 intersection
+        inside the grid. The key in the dictionary encodes the position.
+        """
+        for x in range(0, self.width, 4):
+            for y in range(0, self.height, 4):
+                lid = f"light_{x}_{y}"
+                self.traffic_lights[lid] = (x, y)
+
+    def _add_hospitals(self) -> None:
+        """
+        Add a small number of hospitals in the city.
+
+        This is intentionally simple and deterministic so that
+        emergency vehicles always have a few obvious destinations.
+        """
+        # Place 3 hospitals in different zones of the grid.
+        self.hospitals = {
+            "hospital_nw": (2, self.height - 2),
+            "hospital_ne": (self.width - 3, self.height - 3),
+            "hospital_central": (self.width // 2, self.height // 2),
         }
 
-    # -------------------------
-    # Annotate graph nodes
-    # -------------------------
-    def _annotate_graph(self):
-        for light in self.traffic_lights.values():
-            self.graph.nodes[light]["traffic_light"] = True
-        for hosp in self.hospitals.values():
-            self.graph.nodes[hosp]["hospital"] = True
+    # ------------------------------------------------------------------
+    # Graph convenience helpers
+    # ------------------------------------------------------------------
 
-    # -------------------------
-    # Routing helpers
-    # -------------------------
-    def get_shortest_route(self, start, end, method="astar"):
-        """Compute shortest route using A* or Dijkstra with dynamic edge weights."""
-        self.update_edge_weights()
-        if method == "astar":
-            try:
-                return nx.astar_path(
-                    self.graph, start, end,
-                    heuristic=lambda a, b: abs(a[0]-b[0]) + abs(a[1]-b[1]),
-                    weight="weight"
-                )
-            except nx.NetworkXNoPath:
-                return []
-        else:
-            try:
-                return nx.dijkstra_path(self.graph, start, end, weight="weight")
-            except nx.NetworkXNoPath:
-                return []
-
-    # -------------------------
-    # Helper for drivable edges
-    # -------------------------
-    def get_drivable_edges(self):
-        """Return edges that are not building corners (suitable for incident placement)."""
-        return [e for e in self.graph.edges
-                if e[0] not in self.buildings and e[1] not in self.buildings]
-
-    # -------------------------
-    # Random roadblocks spawning
-    # -------------------------
-    async def random_roadblocks_loop(self, interval=5.0, ttl=10.0, max_blocks=3):
+    def neighbors(self, node: Tuple[int, int]) -> List[Tuple[int, int]]:
         """
-        Periodically spawn temporary roadblocks at random drivable edges.
-        - interval: seconds between spawn attempts
-        - ttl: duration of each roadblock in seconds
-        - max_blocks: max number of new blocks per interval
+        Get the neighbors of a given node in the grid.
+
+        Args:
+            node: Node coordinate (x, y).
+
+        Returns:
+            List of adjacent node coordinates.
+        """
+        return list(self.graph.neighbors(node))
+
+    def get_drivable_edges(self) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+        """
+        Return all edges that can be used by vehicles.
+
+        At the moment this is simply the full edge set of the grid.
+
+        Returns:
+            List of edges as ((x1, y1), (x2, y2)).
+        """
+        return list(self.graph.edges())
+
+    def random_free_node(self) -> Tuple[int, int]:
+        """
+        Pick a random node in the grid.
+
+        This helper does not check congestion or incidents, so it is
+        mainly used for choosing random vehicle goals.
+        """
+        return random.choice(list(self.graph.nodes()))
+
+    # ------------------------------------------------------------------
+    # Dynamic behaviour: congestion and roadblocks
+    # ------------------------------------------------------------------
+
+    def compute_avg_rho(self) -> float | None:
+        """
+        Compute the average congestion (rho) across all edges.
+
+        Returns:
+            Average occupancy value across edges, or None if no
+            occupancy information is available.
+        """
+        if not hasattr(self, "occupancy") or not self.occupancy.edge_counts:
+            return None
+
+        values = list(self.occupancy.edge_counts.values())
+        if not values:
+            return None
+        return sum(values) / len(values)
+
+    def update_edge_weights(self) -> None:
+        """
+        Update edge weights based on current congestion.
+
+        The Occupancy object keeps a "density" estimate for every edge.
+        This method writes that value into the graph's "weight" field,
+        which is then used by the routing algorithms (A*).
+        """
+        for (u, v) in self.graph.edges():
+            # Base cost is 1.0; add a fraction of the occupancy density.
+            rho = self.occupancy.edge_density(u, v)
+            self.graph[u][v]["weight"] = 1.0 + rho
+
+    async def random_roadblocks_loop(
+        self,
+        interval: float = 3.0,
+        ttl: float = 8.0,
+        max_blocks: int = 3,
+    ) -> None:
+        """
+        Periodically spawn and clear temporary roadblocks.
+
+        This coroutine runs forever (until the simulation exits) and
+        uses the EventManager to create high-severity incidents on
+        random edges that are not currently blocked.
+
+        Args:
+            interval:
+                Time in seconds between iterations of the loop.
+            ttl:
+                Time-to-live in seconds for each spawned roadblock.
+            max_blocks:
+                Maximum number of new blocks to spawn per iteration.
         """
         while True:
             await asyncio.sleep(interval)
+
+            # Start from all drivable edges.
             drivable_edges = self.get_drivable_edges()
-            # pick edges that are not already blocked
-            candidates = [e for e in drivable_edges if not self.event_manager.is_blocked(e)]
+
+            # Pick edges that are not already blocked.
+            candidates = [
+                e for e in drivable_edges
+                if not self.event_manager.is_blocked(e)
+            ]
             if not candidates:
                 continue
+
+            # Sample up to max_blocks edges and block them temporarily.
             for edge in random.sample(candidates, min(max_blocks, len(candidates))):
                 self.event_manager.spawn_temporary_block(edge, ttl=ttl)
